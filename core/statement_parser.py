@@ -10,6 +10,7 @@ import pdfplumber
 
 @dataclass
 class StatementInfo:
+    bank_name: str = ""
     account_number: str = ""
     period_from: str = ""
     period_to: str = ""
@@ -18,6 +19,25 @@ class StatementInfo:
     total_deposits: str = ""
     total_withdrawals: str = ""
     transactions: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+
+
+_BANK_PATTERNS: list[tuple[str, str]] = [
+    (r"Royal\s*Bank|RBC\b", "RBC Royal Bank"),
+    (r"TD\s*Canada\s*Trust|TD\s*Bank", "TD Canada Trust"),
+    (r"Bank\s*of\s*Montreal|BMO\b", "BMO Bank of Montreal"),
+    (r"Scotiabank|Scotia\s*Bank|BNS\b", "Scotiabank"),
+    (r"CIBC\b|Canadian\s*Imperial", "CIBC"),
+    (r"HSBC\b", "HSBC"),
+    (r"National\s*Bank|Banque\s*Nationale", "National Bank"),
+    (r"Desjardins", "Desjardins"),
+    (r"Tangerine", "Tangerine"),
+    (r"Simplii", "Simplii Financial"),
+    (r"Chase\b|JPMorgan", "Chase"),
+    (r"Bank\s*of\s*America|BofA\b", "Bank of America"),
+    (r"Wells\s*Fargo", "Wells Fargo"),
+    (r"Citibank|Citi\b", "Citibank"),
+    (r"Capital\s*One", "Capital One"),
+]
 
 
 _Y_TOLERANCE = 4.0  # words within this y-distance are on the same line
@@ -56,6 +76,10 @@ class BankStatementParser:
 
     @staticmethod
     def _parse_summary(text: str, info: StatementInfo) -> None:
+        for pattern, name in _BANK_PATTERNS:
+            if re.search(pattern, text, re.I):
+                info.bank_name = name
+                break
         if m := re.search(r"accountnumber:\s*([\d-]+)", text, re.I):
             info.account_number = m.group(1)
         if m := re.search(r"From\s*(.+?)\s*to\s*(.+?)$", text, re.M | re.I):

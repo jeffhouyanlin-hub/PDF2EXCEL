@@ -181,10 +181,10 @@ def _statement_to_excel(info, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary_data = {
-            "Item": ["Account Number", "Period From", "Period To",
+            "Item": ["Bank Name", "Account Number", "Period From", "Period To",
                      "Opening Balance", "Closing Balance",
                      "Total Deposits", "Total Withdrawals"],
-            "Value": [info.account_number, info.period_from, info.period_to,
+            "Value": [info.bank_name, info.account_number, info.period_from, info.period_to,
                       info.opening_balance, info.closing_balance,
                       info.total_deposits, info.total_withdrawals],
         }
@@ -227,6 +227,8 @@ with tabs[0]:
                         f"Bank statement — {len(stmt_info.transactions)} transaction(s)"
                     )
                     st.markdown("**账户摘要 / Account Summary**")
+                    if stmt_info.bank_name:
+                        st.metric("银行 / Bank", stmt_info.bank_name)
                     col1, col2 = st.columns(2)
                     col1.metric("账户 / Account", stmt_info.account_number)
                     col2.metric(
