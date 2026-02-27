@@ -110,20 +110,20 @@ if st.session_state.get("show_feedback"):
             if not formspree_id:
                 st.error("反馈服务未配置，请联系管理员。/ Feedback service not configured.")
             else:
+                import base64
                 with st.spinner("正在提交... / Submitting..."):
+                    pdf_b64 = base64.b64encode(feedback_file.getvalue()).decode()
                     resp = requests.post(
                         f"https://formspree.io/f/{formspree_id}",
-                        files={
-                            "attachment": (
-                                feedback_file.name,
-                                feedback_file.getvalue(),
-                                "application/pdf",
-                            )
-                        },
-                        data={
+                        json={
+                            "email": "feedback@pdf2excel.app",
                             "message": feedback_text,
                             "_subject": f"PDF2EXCEL 反馈: {feedback_file.name}",
+                            "filename": feedback_file.name,
+                            "filesize": f"{len(feedback_file.getvalue()) / 1024:.1f} KB",
+                            "pdf_data": pdf_b64,
                         },
+                        headers={"Accept": "application/json"},
                     )
                 if resp.ok:
                     st.success("反馈已提交，感谢您的支持！/ Feedback submitted, thank you!")
