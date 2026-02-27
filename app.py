@@ -16,6 +16,23 @@ from core.statement_parser import BankStatementParser
 
 st.set_page_config(page_title="PDF2EXCEL", page_icon="📊", layout="wide")
 
+# --- 密码验证 ---
+def _check_password() -> bool:
+    if st.session_state.get("authenticated"):
+        return True
+    pwd = st.text_input("请输入访问密码", type="password", key="pwd_input")
+    if not pwd:
+        st.stop()
+    if pwd == st.secrets.get("APP_PASSWORD", ""):
+        st.session_state.authenticated = True
+        st.rerun()
+    else:
+        st.error("密码错误")
+        st.stop()
+    return False
+
+_check_password()
+
 st.title("📊 PDF2EXCEL")
 st.caption("PDF 表格 → Excel 批量转换工具")
 
