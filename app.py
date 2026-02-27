@@ -5,6 +5,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import requests
+
 import pandas as pd
 import streamlit as st
 from openpyxl.utils import get_column_letter
@@ -34,7 +36,7 @@ def _check_password() -> bool:
 _check_password()
 
 st.title("📊 PDF2EXCEL")
-st.caption("PDF 表格 → Excel 批量转换工具")
+st.caption("PDF 表格 → Excel 批量转换工具 · v0.2.0")
 
 # --- 侧边栏设置 ---
 with st.sidebar:
@@ -52,6 +54,8 @@ with st.sidebar:
     )
     sheet_per_table = sheet_mode == "每个表格一个 Sheet"
     max_workers = st.slider("并行线程数", 1, 8, 4)
+    st.divider()
+    st.caption("© Dr. Jeff Hou")
 
 # --- 文件上传 ---
 uploaded_files = st.file_uploader(
@@ -122,7 +126,7 @@ def _statement_to_excel(info, output_path: Path) -> Path:
 
 
 # --- 预览 & 转换 ---
-tabs = st.tabs(["📋 预览", "⚡ 批量转换"])
+tabs = st.tabs(["📋 预览", "⚡ 批量转换", "📮 意见反馈"])
 
 with tabs[0]:
     st.subheader("表格预览")
@@ -233,3 +237,33 @@ with tabs[1]:
                         mime="application/zip",
                         use_container_width=True,
                     )
+
+with tabs[2]:
+    st.subheader("意见反馈")
+    st.info("若您的对账单无法识别或识别错误，请提交样本和错误描述，我们会安排优化解决。")
+
+    with st.form("feedback_form", clear_on_submit=True):
+        feedback_file = st.file_uploader("上传 PDF 样本", type=["pdf"], key="feedback_pdf")
+        feedback_text = st.text_area("错误描述", placeholder="请描述您遇到的问题...")
+        submitted = st.form_submit_button("提交反馈", type="primary", use_container_width=True)
+
+    if submitted:
+        if not feedback_file:
+            st.warning("请上传 PDF 文件。")
+        elif not feedback_text.strip():
+            st.warning("请填写错误描述。")
+        else:
+            formspree_id = st.secrets.get("FORMSPREE_ID", "")
+            if not formspree_id:
+                st.error("反馈服务未配置，请联系管理员。")
+            else:
+                with st.spinner("正在提交..."):
+                    resp = requests.post(
+                        f"https://formspree.io/f/{formspree_id}",
+                        files={"attachment": (feedback_file.name, feedback_file.getvalue(), "application/pdf")},
+                        data={"message": feedback_text, "_subject": f"PDF2EXCEL 反馈: {feedback_file.name}"},
+                    )
+                if resp.ok:
+                    st.success("反馈已提交，感谢您的支持！")
+                else:
+                    st.error(f"提交失败（{resp.status_code}），请稍后重试。")
