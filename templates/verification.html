@@ -144,6 +144,9 @@ var ecr=document.getElementById('ecr'), pcr=document.getElementById('pcr');
 var ctrEl=document.getElementById('ctr'), sttEl=document.getElementById('stt');
 var prevSeg=-1;
 
+/* Add bottom padding = 50% of viewport so the last row can scroll to 50% */
+esEl.style.paddingBottom=Math.ceil(esEl.clientHeight/2)+'px';
+
 /* Expose current index for P4 */
 window.getCurrentIdx=function(){return curIdx;};
 
@@ -343,6 +346,8 @@ script.onload=function(){
         pageCanvases[i].offsetTop=pageCanvases[i].canvas.offsetTop;
         pageCanvases[i].renderHeight=pageCanvases[i].canvas.offsetHeight;
       }
+      /* Add bottom padding = 50% of viewport so last PDF row can scroll to 50% */
+      psEl.style.paddingBottom=Math.ceil(psEl.clientHeight/2)+'px';
       /* If already stepped to a row, re-sync PDF via P3 bridge */
       if(window.triggerSync) window.triggerSync();
     });
