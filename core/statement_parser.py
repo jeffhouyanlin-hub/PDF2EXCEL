@@ -96,11 +96,14 @@ class BankStatementParser:
         with pdfplumber.open(pdf_path) as pdf:
             for page_idx, page in enumerate(pdf.pages):
                 words = page.extract_words(keep_blank_chars=True, x_tolerance=1)
-                words = [w for w in words if w["x0"] >= 40]
 
                 col_bounds, header_y = self._detect_columns(words)
                 if not col_bounds:
                     continue
+
+                # Dynamic left boundary from header detection
+                left_boundary = min(x0 for x0, _ in col_bounds.values()) - 5
+                words = [w for w in words if w["x0"] >= left_boundary]
 
                 # 提取原始表头文字（仅从第一个有效页获取）
                 if not headers:
@@ -116,9 +119,10 @@ class BankStatementParser:
                 if not tx_words:
                     continue
 
+                col_centers = self._compute_col_centers(col_bounds)
                 lines = self._group_by_y(tx_words)
                 for line_words in lines:
-                    row = self._classify_words(line_words, col_bounds)
+                    row = self._classify_words(line_words, col_bounds, col_centers)
                     if not row:
                         continue
                     y_top = min(w["top"] for w in line_words)
@@ -228,8 +232,7 @@ class BankStatementParser:
 
                 # Detect transaction header to identify summary area boundary
                 if tx_header_page < 0:
-                    filtered = [w for w in words if w["x0"] >= 40]
-                    _, hy = self._detect_columns(filtered)
+                    _, hy = self._detect_columns(words)
                     if hy > 0:
                         tx_header_page = page_idx
                         tx_header_y = hy
@@ -330,13 +333,15 @@ class BankStatementParser:
 
     def _extract_transaction_rows(self, words: list[dict]) -> list[dict]:
         """从 word 坐标中提取交易行。"""
-        # Filter out margin noise (x0 < 40)
-        words = [w for w in words if w["x0"] >= 40]
-
-        # Dynamically detect column boundaries from header row
+        # Two-pass column detection: first unfiltered to find header,
+        # then use header-derived left boundary to filter noise.
         col_bounds, header_y = self._detect_columns(words)
         if not col_bounds:
             return []
+
+        # Dynamic left boundary: use the leftmost column's x0 with margin
+        left_boundary = min(x0 for x0, _ in col_bounds.values()) - 5
+        words = [w for w in words if w["x0"] >= left_boundary]
 
         # Only words below the header
         tx_words = [w for w in words if w["top"] > header_y + 5]
@@ -345,9 +350,12 @@ class BankStatementParser:
 
         lines = self._group_by_y(tx_words)
 
+        # Compute column center points for nearest-center matching
+        col_centers = self._compute_col_centers(col_bounds)
+
         rows: list[dict] = []
         for line_words in lines:
-            row = self._classify_words(line_words, col_bounds)
+            row = self._classify_words(line_words, col_bounds, col_centers)
             if row:
                 rows.append(row)
 
@@ -376,7 +384,8 @@ class BankStatementParser:
         if "withdrawals" not in header_words:
             return None, 0.0
 
-        # Build column bounds: each column extends from its x0 to the next column's x0
+        # Build column bounds: each column extends from its x0 to the
+        # midpoint between this column's x1 and the next column's x0
         ordered = sorted(
             [(name, (x0, x1)) for name, (x0, x1, _) in header_words.items()],
             key=lambda kv: kv[1][0],
@@ -385,7 +394,9 @@ class BankStatementParser:
         for i, (name, (x0, x1)) in enumerate(ordered):
             if i + 1 < len(ordered):
                 next_x0 = ordered[i + 1][1][0]
-                bounds[name] = (x0, next_x0 - 1)
+                # Use midpoint of gap between columns as boundary
+                mid = (x1 + next_x0) / 2
+                bounds[name] = (x0, mid)
             else:
                 bounds[name] = (x0, x1 + 50)  # last column extends right
 
@@ -394,6 +405,11 @@ class BankStatementParser:
             bounds["date"] = (bounds["date"][0] - 5, bounds["date"][1])
 
         return bounds, header_y
+
+    @staticmethod
+    def _compute_col_centers(col_bounds: dict[str, tuple[float, float]]) -> dict[str, float]:
+        """Compute x-center for each column header (for nearest-center matching)."""
+        return {name: (x0 + x1) / 2 for name, (x0, x1) in col_bounds.items()}
 
     @staticmethod
     def _group_by_y(words: list[dict]) -> list[list[dict]]:
@@ -416,15 +432,40 @@ class BankStatementParser:
         return lines
 
     @staticmethod
-    def _classify_words(line_words: list[dict], col_bounds: dict) -> dict | None:
-        """根据动态列边界将 word 分到对应列。"""
+    def _classify_words(
+        line_words: list[dict],
+        col_bounds: dict,
+        col_centers: dict[str, float] | None = None,
+    ) -> dict | None:
+        """根据动态列边界将 word 分到对应列。
+
+        Uses two-phase matching:
+        1. If the word's x_center falls within exactly one column's bounds → assign.
+        2. If ambiguous (boundary overlap), use nearest column center.
+        """
+        if col_centers is None:
+            col_centers = {name: (x0 + x1) / 2 for name, (x0, x1) in col_bounds.items()}
+
         cols = {k: [] for k in col_bounds}
         for w in line_words:
             x_center = (w["x0"] + w["x1"]) / 2
+
+            # Phase 1: find all columns whose bounds contain this word
+            candidates = []
             for col_name, (x_min, x_max) in col_bounds.items():
-                if x_min <= w["x0"] <= x_max or x_min <= x_center <= x_max:
-                    cols[col_name].append(w["text"])
-                    break
+                if x_min <= x_center <= x_max:
+                    candidates.append(col_name)
+
+            if len(candidates) == 1:
+                cols[candidates[0]].append(w["text"])
+            elif len(candidates) > 1:
+                # Phase 2: ambiguous — pick nearest column center
+                best = min(candidates, key=lambda c: abs(x_center - col_centers[c]))
+                cols[best].append(w["text"])
+            else:
+                # Outside all bounds — assign to nearest column center
+                best = min(col_centers, key=lambda c: abs(x_center - col_centers[c]))
+                cols[best].append(w["text"])
 
         has_content = any(cols[c] for c in cols)
         if not has_content:
