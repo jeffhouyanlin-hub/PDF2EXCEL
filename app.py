@@ -79,7 +79,7 @@ with st.sidebar:
     sheet_per_table = sheet_mode == "每个表格一个 Sheet"
     max_workers = st.slider("并行线程数 / Parallel Threads", 1, 8, 4)
     st.divider()
-    st.caption("© Dr. Jeff Hou · v0.4.3")
+    st.caption("© Dr. Jeff Hou · v0.4.4")
     if st.button("📮 报错反馈 / Error Feedback", use_container_width=True):
         st.session_state.show_feedback = True
     if st.button("🔍 数据复核 / Data Verification", use_container_width=True):
@@ -284,17 +284,29 @@ if st.session_state.get("show_verification"):
             st.rerun()
         st.stop()
 
-    st.subheader("🔍 数据复核 / Data Verification")
-
-    # --- 数据准备 ---
+    # --- Header row: title | file selector | download | back ---
     _v_file_names = list(_vdata["files"].keys())
-    _ctrl = st.columns([5, 1])
-    with _ctrl[0]:
+    _hdr = st.columns([3.5, 3, 1.5, 1.5])
+    with _hdr[0]:
+        st.subheader("🔍 数据复核 / Data Verification")
+    with _hdr[1]:
         _v_sel_file = st.selectbox(
             "文件 / File", _v_file_names, key="verify_file_sel",
         )
-    with _ctrl[1]:
-        if st.button("返回 / Back", key="verify_back", use_container_width=True):
+    with _hdr[2]:
+        st.write("")  # vertical spacer to align with selectbox
+        _v_dl_info = _vdata["files"][_v_sel_file]
+        st.download_button(
+            "⬇ 下载 / Download",
+            _v_dl_info["excel_bytes"],
+            file_name=f"{_v_sel_file}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="verify_download_excel",
+        )
+    with _hdr[3]:
+        st.write("")  # vertical spacer
+        if st.button("↩ 返回 / Back", key="verify_back", use_container_width=True):
             st.session_state.show_verification = False
             st.rerun()
 
@@ -503,8 +515,18 @@ uploaded_files = st.file_uploader(
 )
 
 if not uploaded_files:
+    # No files → clear stale verification cache
+    st.session_state.pop("verification_data", None)
+    st.session_state.pop("_uploaded_file_names", None)
     st.info("请上传一个或多个 PDF 文件开始转换。/ Please upload one or more PDF files to start.")
     st.stop()
+
+# Track uploaded file names; clear verification cache when files change
+_cur_file_names = frozenset(f.name for f in uploaded_files)
+_prev_file_names = st.session_state.get("_uploaded_file_names", frozenset())
+if _cur_file_names != _prev_file_names:
+    st.session_state.pop("verification_data", None)
+    st.session_state["_uploaded_file_names"] = _cur_file_names
 
 st.divider()
 
