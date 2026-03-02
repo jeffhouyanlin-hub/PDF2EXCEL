@@ -1,6 +1,6 @@
 [project]
 name = "pdf2excel"
-version = "0.2.0"
+version = "0.3.0"
 description = "PDF 表格提取 → Excel 批量转换工具"
 requires-python = ">=3.10"
 dependencies = [

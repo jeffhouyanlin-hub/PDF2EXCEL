@@ -9,6 +9,15 @@ import pdfplumber
 
 
 @dataclass
+class RowPosition:
+    """PDF 中一行数据的坐标信息。"""
+    page_index: int        # 0-based 页码
+    y_top: float           # 行顶部 y 坐标（PDF points）
+    y_bottom: float        # 行底部 y 坐标
+    page_height: float     # 该页总高度（用于算百分比）
+
+
+@dataclass
 class StatementInfo:
     bank_name: str = ""
     account_number: str = ""
@@ -73,6 +82,231 @@ class BankStatementParser:
 
         info.transactions = self._build_dataframe(all_rows)
         return info
+
+    def get_row_positions(self, pdf_path: str | Path) -> tuple[list[str], list[RowPosition]]:
+        """返回 (原始表头列表, 合并后的行坐标列表)。
+
+        表头列表: 从 PDF header 行直接读取的原始文字
+        行坐标列表: 与 _build_dataframe() 合并结果对齐，len(positions) == len(DataFrame)
+        """
+        pdf_path = Path(pdf_path)
+        headers: list[str] = []
+        raw_entries: list[tuple[RowPosition, dict]] = []
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_idx, page in enumerate(pdf.pages):
+                words = page.extract_words(keep_blank_chars=True, x_tolerance=1)
+                words = [w for w in words if w["x0"] >= 40]
+
+                col_bounds, header_y = self._detect_columns(words)
+                if not col_bounds:
+                    continue
+
+                # 提取原始表头文字（仅从第一个有效页获取）
+                if not headers:
+                    header_words = [
+                        w for w in words
+                        if abs(w["top"] - header_y) <= _Y_TOLERANCE
+                    ]
+                    header_words.sort(key=lambda w: w["x0"])
+                    headers = [w["text"] for w in header_words]
+
+                # 筛选 header 以下的 words
+                tx_words = [w for w in words if w["top"] > header_y + 5]
+                if not tx_words:
+                    continue
+
+                lines = self._group_by_y(tx_words)
+                for line_words in lines:
+                    row = self._classify_words(line_words, col_bounds)
+                    if not row:
+                        continue
+                    y_top = min(w["top"] for w in line_words)
+                    y_bottom = max(w["bottom"] for w in line_words)
+                    pos = RowPosition(page_idx, y_top, y_bottom, page.height)
+                    raw_entries.append((pos, row))
+
+        # --- 同 _build_dataframe 一致的过滤/合并流水线 ---
+
+        # 1. 截断: Closing Balance 之后丢弃
+        truncated: list[tuple[RowPosition, dict]] = []
+        for pos, row in raw_entries:
+            truncated.append((pos, row))
+            if re.search(r"Closing\s*Balance", row.get("Description", ""), re.I):
+                break
+
+        # 2. 噪声过滤
+        noise_re = re.compile(
+            r"(\d+\s*of\s*\d+|RBPDA|\d{7}-\d{3}_|0050750|^\d{4}$)", re.I,
+        )
+        cleaned: list[tuple[RowPosition, dict]] = []
+        for pos, row in truncated:
+            all_text = " ".join(v for v in row.values() if v).strip()
+            if noise_re.search(all_text):
+                continue
+            desc = row.get("Description", "").strip()
+            has_amounts = (
+                row["Withdrawals"].strip()
+                or row["Deposits"].strip()
+                or row["Balance"].strip()
+            )
+            if not desc and not has_amounts:
+                continue
+            cleaned.append((pos, row))
+
+        # 3. 合并多行记录（与 _build_dataframe 完全一致的逻辑）
+        merged = self._merge_positions_by_content(cleaned)
+
+        return headers, merged
+
+    @staticmethod
+    def _merge_positions_by_content(
+        entries: list[tuple[RowPosition, dict]],
+    ) -> list[RowPosition]:
+        """用与 _build_dataframe 相同的逻辑合并续行位置。"""
+        merged: list[tuple[RowPosition, dict]] = []
+        for pos, row in entries:
+            has_date = bool(row["Date"].strip())
+            has_desc = bool(row["Description"].strip())
+            prev_has_amounts = bool(
+                merged
+                and (
+                    merged[-1][1]["Withdrawals"].strip()
+                    or merged[-1][1]["Deposits"].strip()
+                )
+            )
+            if not has_date and has_desc and merged and not prev_has_amounts:
+                # 续行: 同步更新 row dict（与 _build_dataframe 完全一致）
+                prev_pos, prev_row = merged[-1]
+                prev_row["Description"] += " " + row["Description"].strip()
+                for col in ("Withdrawals", "Deposits", "Balance"):
+                    if row[col].strip() and not prev_row[col].strip():
+                        prev_row[col] = row[col]
+                # 扩展 y_bottom
+                if pos.page_index == prev_pos.page_index:
+                    merged[-1] = (
+                        RowPosition(
+                            prev_pos.page_index,
+                            prev_pos.y_top,
+                            max(prev_pos.y_bottom, pos.y_bottom),
+                            prev_pos.page_height,
+                        ),
+                        prev_row,
+                    )
+                # 跨页续行极少见，保持前一条不变
+            else:
+                merged.append((pos, dict(row)))  # 复制 dict 防止突变
+        return [p for p, _ in merged]
+
+    def get_summary_positions(
+        self,
+        pdf_source: str | Path | bytes,
+        summary_items: list[dict],
+    ) -> list[RowPosition | None]:
+        """根据 Summary Excel 行的 Value 在 PDF 中搜索匹配位置。
+
+        pdf_source: 文件路径或 PDF 字节数据
+        summary_items: [{"item": "Opening Balance", "value": "1,234.56"}, ...]
+        返回与输入等长的列表，匹配到则为 RowPosition，未匹配为 None。
+        主索引: value 值匹配；辅助验证: item 文字。
+        """
+        import io as _io
+
+        if isinstance(pdf_source, bytes):
+            pdf_input = _io.BytesIO(pdf_source)
+        else:
+            pdf_input = Path(pdf_source)
+        lines_index: list[dict] = []
+        tx_header_page = -1
+        tx_header_y = 0.0
+
+        with pdfplumber.open(pdf_input) as pdf:
+            for page_idx, page in enumerate(pdf.pages):
+                words = page.extract_words(keep_blank_chars=True, x_tolerance=1)
+                if not words:
+                    continue
+
+                # Detect transaction header to identify summary area boundary
+                if tx_header_page < 0:
+                    filtered = [w for w in words if w["x0"] >= 40]
+                    _, hy = self._detect_columns(filtered)
+                    if hy > 0:
+                        tx_header_page = page_idx
+                        tx_header_y = hy
+
+                grouped = self._group_by_y(words)
+                for line_words in grouped:
+                    text = " ".join(w["text"] for w in line_words)
+                    y_top = min(w["top"] for w in line_words)
+                    y_bottom = max(w["bottom"] for w in line_words)
+                    # Summary area = above transaction header on its page
+                    is_summary = (
+                        tx_header_page < 0 and page_idx == 0  # 找不到表头→第0页为summary
+                    ) or (
+                        tx_header_page >= 0 and (
+                            page_idx < tx_header_page
+                            or (page_idx == tx_header_page and y_top < tx_header_y)
+                        )
+                    )
+                    lines_index.append({
+                        "text": text,
+                        "y_top": y_top,
+                        "y_bottom": y_bottom,
+                        "page_idx": page_idx,
+                        "page_height": page.height,
+                        "is_summary": is_summary,
+                    })
+
+        results: list[RowPosition | None] = []
+        for item in summary_items:
+            value = str(item.get("value", "")).strip()
+            if not value:
+                results.append(None)
+                continue
+            pos = self._search_value_in_lines(
+                value, str(item.get("item", "")), lines_index,
+            )
+            results.append(pos)
+        return results
+
+    @staticmethod
+    def _search_value_in_lines(
+        value: str, item_name: str, lines_index: list[dict],
+    ) -> RowPosition | None:
+        """在 PDF 行中搜索 value，优先 summary 区域。"""
+        clean_value = value.replace(",", "").replace("$", "").strip()
+
+        for prefer_summary in (True, False):
+            candidates = []
+            for line in lines_index:
+                if prefer_summary and not line["is_summary"]:
+                    continue
+                line_text = line["text"]
+                clean_line = line_text.replace(",", "").replace("$", "")
+                if value in line_text or clean_value in clean_line:
+                    candidates.append(line)
+
+            if not candidates:
+                continue
+
+            if len(candidates) == 1:
+                c = candidates[0]
+                return RowPosition(c["page_idx"], c["y_top"],
+                                   c["y_bottom"], c["page_height"])
+
+            # Multiple candidates — disambiguate with item_name
+            item_parts = [p.lower() for p in item_name.split() if len(p) > 2]
+            for c in candidates:
+                line_lower = c["text"].lower()
+                if any(part in line_lower for part in item_parts):
+                    return RowPosition(c["page_idx"], c["y_top"],
+                                       c["y_bottom"], c["page_height"])
+
+            # Fallback: first candidate
+            c = candidates[0]
+            return RowPosition(c["page_idx"], c["y_top"],
+                               c["y_bottom"], c["page_height"])
+        return None
 
     @staticmethod
     def _parse_summary(text: str, info: StatementInfo) -> None:

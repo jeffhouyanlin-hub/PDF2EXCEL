@@ -12,10 +12,12 @@ python -m pytest tests/ -v --cov=core
 ## Architecture
 
 ```
-core/extractor.py   PDFExtractor     pdfplumber 提取表格 → list[DataFrame]
-core/converter.py   ExcelConverter   DataFrame → .xlsx (openpyxl, 自动列宽)
-core/batch.py       BatchProcessor   ThreadPoolExecutor 并行批处理
-app.py              Streamlit UI     上传/预览/转换/下载
+core/extractor.py        PDFExtractor       pdfplumber 提取表格 → list[DataFrame]
+core/converter.py        ExcelConverter     DataFrame → .xlsx (openpyxl, 自动列宽)
+core/batch.py            BatchProcessor     ThreadPoolExecutor 并行批处理
+core/statement_parser.py BankStatementParser 银行账单 PDF 坐标解析
+core/verifier.py         DataVerifier       PDF↔Excel 逐单元格对比验证
+app.py                   Streamlit UI       上传/预览/转换/下载/数据复核
 ```
 
 ## Key Types
@@ -23,6 +25,8 @@ app.py              Streamlit UI     上传/预览/转换/下载
 - `ExtractionResult(tables, page_count, source)` — 单个 PDF 提取结果
 - `FileResult(source, output, table_count, success, error)` — 单文件处理结果
 - `BatchResult(results, total, succeeded, failed)` — 批量处理结果
+- `CellDiff(sheet, row, column, expected, actual)` — 单元格差异
+- `VerificationResult(matched, total_cells, mismatched_cells, diffs, message)` — 验证结果
 
 ## Data Flow
 
