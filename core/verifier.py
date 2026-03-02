@@ -145,10 +145,12 @@ class ArithmeticChecker:
 
     @staticmethod
     def _parse_amount(value: str | object) -> float:
-        """'2,788.09' -> 2788.09, empty/invalid -> 0.0"""
+        """'2,788.09' -> 2788.09, '- 234.36' -> -234.36, empty/invalid -> 0.0"""
         if value is None:
             return 0.0
         s = str(value).replace(",", "").replace("$", "").strip()
+        # Remove spaces within the number (e.g. "- 234.36" → "-234.36")
+        s = re.sub(r"\s+", "", s)
         if not s:
             return 0.0
         try:
@@ -161,7 +163,13 @@ class ArithmeticChecker:
         df: pd.DataFrame,
         opening: float,
     ) -> list[ArithmeticIssue]:
-        """Balance[i] = Balance[i-1] - Withdrawal[i] + Deposit[i]"""
+        """Balance[i] = Balance[i-1] - Withdrawal[i] + Deposit[i]
+
+        Bank statements often omit Balance on intermediate rows (e.g. when
+        multiple transactions share the same date).  We must still accumulate
+        their Withdrawals/Deposits into the running expected balance — only
+        the comparison against a printed Balance is skipped.
+        """
         issues: list[ArithmeticIssue] = []
         if df.empty or "Balance" not in df.columns:
             return issues
@@ -170,13 +178,18 @@ class ArithmeticChecker:
         for i in range(len(df)):
             withdrawal = self._parse_amount(df.iloc[i].get("Withdrawals", ""))
             deposit = self._parse_amount(df.iloc[i].get("Deposits", ""))
-            balance = self._parse_amount(df.iloc[i].get("Balance", ""))
+            balance_str = str(df.iloc[i].get("Balance", "")).strip()
 
-            # Skip rows without a balance value (e.g. closing balance row)
-            if not str(df.iloc[i].get("Balance", "")).strip():
+            # Always accumulate this row's amounts into the running balance
+            expected = prev_balance - withdrawal + deposit
+
+            if not balance_str:
+                # No printed balance — carry the computed expected forward
+                prev_balance = expected
                 continue
 
-            expected = prev_balance - withdrawal + deposit
+            # Compare the computed expected against the printed balance
+            balance = self._parse_amount(balance_str)
             if abs(expected - balance) > self.TOLERANCE:
                 issues.append(ArithmeticIssue(
                     check="balance_continuity",
@@ -188,6 +201,7 @@ class ArithmeticChecker:
                         f"Row {i + 1} balance discontinuity: expected {expected:.2f}, actual {balance:.2f}"
                     ),
                 ))
+            # Use the actual printed balance as the new baseline
             prev_balance = balance
 
         return issues

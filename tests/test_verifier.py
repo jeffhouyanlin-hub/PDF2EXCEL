@@ -172,6 +172,11 @@ class TestArithmeticChecker:
         assert checker._parse_amount(None) == 0.0
         assert checker._parse_amount("abc") == 0.0
 
+    def test_parse_amount_negative_with_space(self, checker):
+        """Bank statements may format negatives as '- 234.36'."""
+        assert checker._parse_amount("- 234.36") == pytest.approx(-234.36)
+        assert checker._parse_amount("-234.36") == pytest.approx(-234.36)
+
     def test_balance_continuity_pass(self, checker):
         df = pd.DataFrame({
             "Date": ["Jan 01", "Jan 02"],
@@ -180,6 +185,19 @@ class TestArithmeticChecker:
             "Deposits": ["100.00", ""],
             "Balance": ["1100.00", "1050.00"],
         })
+        issues = checker._check_balance_continuity(df, opening=1000.0)
+        assert len(issues) == 0
+
+    def test_balance_continuity_with_missing_balances(self, checker):
+        """Rows without printed Balance should still accumulate amounts."""
+        df = pd.DataFrame({
+            "Date": ["Jan 01", "Jan 01", "Jan 01"],
+            "Description": ["Deposit A", "Deposit B", "Withdrawal"],
+            "Withdrawals": ["", "", "50.00"],
+            "Deposits": ["100.00", "200.00", ""],
+            "Balance": ["", "", "1250.00"],  # only last row has balance
+        })
+        # 1000 + 100 + 200 - 50 = 1250 ✓
         issues = checker._check_balance_continuity(df, opening=1000.0)
         assert len(issues) == 0
 
