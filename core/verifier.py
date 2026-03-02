@@ -92,6 +92,26 @@ class TripleVerificationResult:
     message: str = ""
 
 
+def _normalize_cross(value: object) -> str:
+    """Stricter normalization for cross-extraction comparison (A vs B).
+
+    In addition to standard normalization, removes ALL spaces from text
+    to tolerate layout-text concatenation artifacts (e.g. 'TermLoan' vs 'Term Loan').
+    Numeric values are canonicalized without commas (e.g. '2,788.09' → '2788.09').
+    """
+    base = _normalize(value)
+    # For numeric values, canonicalize to comma-free form
+    try:
+        num = float(base.replace(",", ""))
+        if not (num != num):  # not NaN
+            rounded = f"{round(num, 2):.2f}"
+            return rounded.rstrip("0").rstrip(".")
+    except (ValueError, OverflowError):
+        pass
+    # For text values, strip all spaces and lowercase for comparison
+    return re.sub(r"\s+", "", base).lower()
+
+
 class ArithmeticChecker:
     """Layer 3: arithmetic consistency checks on transaction data."""
 
@@ -282,7 +302,7 @@ class TripleVerifier:
         except Exception:
             pass
 
-        # Layer 1: A vs B (cross-extraction)
+        # Layer 1: A vs B (cross-extraction, space-insensitive)
         if source_b.empty:
             layer1 = LayerResult(
                 name="A_vs_B",
@@ -293,7 +313,9 @@ class TripleVerifier:
                 skipped=True,
             )
         else:
-            diffs_ab, cells_ab = DataVerifier._compare_dfs(source_a, source_b, "A_vs_B")
+            diffs_ab, cells_ab = DataVerifier._compare_dfs(
+                source_a, source_b, "A_vs_B", normalize_fn=_normalize_cross,
+            )
             layer1 = LayerResult(
                 name="A_vs_B",
                 label="交叉提取 / Cross-Extraction",
@@ -451,8 +473,13 @@ class DataVerifier:
         expected: pd.DataFrame,
         actual: pd.DataFrame,
         sheet_name: str,
+        normalize_fn: callable = None,
     ) -> tuple[list[CellDiff], int]:
-        """逐单元格比较两个 DataFrame，返回 (差异列表, 总单元格数)。"""
+        """逐单元格比较两个 DataFrame，返回 (差异列表, 总单元格数)。
+
+        normalize_fn: optional normalization function override (default: _normalize).
+        """
+        norm = normalize_fn or _normalize
         diffs: list[CellDiff] = []
 
         # 统一列名
@@ -468,16 +495,16 @@ class DataVerifier:
 
         for row_idx in range(max_rows):
             for col in common_cols:
-                exp_val = _normalize(expected.iloc[row_idx][col])
-                act_val = _normalize(actual.iloc[row_idx][col])
+                exp_val = norm(expected.iloc[row_idx][col])
+                act_val = norm(actual.iloc[row_idx][col])
                 if exp_val != act_val:
                     diffs.append(
                         CellDiff(
                             sheet=sheet_name,
                             row=row_idx,
                             column=col,
-                            expected=exp_val,
-                            actual=act_val,
+                            expected=_normalize(expected.iloc[row_idx][col]),
+                            actual=_normalize(actual.iloc[row_idx][col]),
                         )
                     )
 

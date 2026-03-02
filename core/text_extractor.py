@@ -40,24 +40,34 @@ class TextBasedExtractor:
         if not pages:
             return TextExtractionResult()
 
-        # Combine all pages for summary extraction
-        full_text = "\n".join(pages)
+        # Process each page independently: detect header per page,
+        # extract transactions with page-specific column boundaries.
+        summary_lines: list[str] = []
+        all_raw_rows: list[dict] = []
+        found_first_header = False
 
-        # Find header across all pages
-        all_lines: list[str] = []
-        page_offsets: list[int] = []  # line offset for each page
         for page_text in pages:
-            page_offsets.append(len(all_lines))
-            all_lines.extend(page_text.split("\n"))
+            page_lines = page_text.split("\n")
+            header_idx, bounds = self._find_header(page_lines)
 
-        header_idx, bounds = self._find_header(all_lines)
-        if header_idx < 0 or not bounds:
-            return TextExtractionResult(summary=self._extract_summary(all_lines))
+            if header_idx < 0 or not bounds:
+                # No header on this page — if we haven't seen a header yet,
+                # these are summary lines; otherwise skip the page
+                if not found_first_header:
+                    summary_lines.extend(page_lines)
+                continue
 
-        raw_rows = self._parse_transactions(all_lines, header_idx, bounds)
-        summary = self._extract_summary(all_lines[:header_idx])
+            if not found_first_header:
+                # Lines before the first header on this page are summary
+                summary_lines.extend(page_lines[:header_idx])
+                found_first_header = True
 
-        df = self._build_dataframe(raw_rows)
+            # Parse transactions from this page using its own bounds
+            page_rows = self._parse_page_transactions(page_lines, header_idx, bounds)
+            all_raw_rows.extend(page_rows)
+
+        summary = self._extract_summary(summary_lines)
+        df = self._build_dataframe(all_raw_rows)
         return TextExtractionResult(transactions=df, summary=summary)
 
     @staticmethod
@@ -83,21 +93,31 @@ class TextBasedExtractor:
         Returns (-1, {}) if no header found.
         """
         for i, line in enumerate(lines):
-            # Check if this line contains all column keywords (with optional ($) suffix)
-            found = {}
+            # Check if this line contains the required column keywords
+            found: dict[str, tuple[int, int]] = {}
             for kw in _COL_KEYWORDS:
                 # Match keyword possibly followed by ($) or spaces
                 pattern = re.compile(r"\b" + re.escape(kw) + r"(?:\s*\(\$\))?", re.I)
                 m = pattern.search(line)
                 if m:
-                    found[kw] = m.start()
+                    found[kw] = (m.start(), m.end())
 
             # Need at least Date, Withdrawals, Deposits, Balance
             required = {"Date", "Withdrawals", "Deposits", "Balance"}
             if required.issubset(found.keys()):
-                # Compute boundaries: each column extends from its start to
-                # the next column's start (sorted by position)
-                sorted_cols = sorted(found.items(), key=lambda kv: kv[1])
+                # Build adjusted start positions: for Balance, use midpoint
+                # between Deposits keyword end and Balance keyword start.
+                # Balance values are right-aligned and often extend leftward
+                # past the header keyword position (e.g. "14,951.88" wider than "Balance").
+                col_starts = {col: pos[0] for col, pos in found.items()}
+                if "Balance" in found and "Deposits" in found:
+                    dep_match_end = found["Deposits"][1]
+                    bal_match_start = found["Balance"][0]
+                    col_starts["Balance"] = (dep_match_end + bal_match_start) // 2
+
+                # Compute boundaries: each column extends from its (adjusted)
+                # start to the next column's start (sorted by position)
+                sorted_cols = sorted(col_starts.items(), key=lambda kv: kv[1])
                 bounds: dict[str, tuple[int, int]] = {}
                 for j, (col, start) in enumerate(sorted_cols):
                     if j + 1 < len(sorted_cols):
@@ -116,17 +136,38 @@ class TextBasedExtractor:
         for col, (start, end) in bounds.items():
             val = line[start:end] if start < len(line) else ""
             result[col] = val.strip()
+
+        # Post-process: fix text overflow from Description into numeric columns.
+        # Layout text can have long descriptions that spill into Withdrawals/Deposits.
+        # Patterns: "ZR 41.59" (text+amount), "742 300.00" (account-number+amount),
+        # or pure text overflow like "SINC" (no amount at all).
+        for num_col in ("Withdrawals", "Deposits"):
+            val = result.get(num_col, "")
+            if not val:
+                continue
+            # Pattern 1: overflow text/number followed by a currency amount (XX.XX)
+            m = re.match(r"^(.+?)\s+([\d,]+\.\d{2})$", val)
+            if m:
+                overflow_text = m.group(1)
+                numeric_part = m.group(2)
+                result[num_col] = numeric_part
+                result["Description"] = (result.get("Description", "") + " " + overflow_text).strip()
+                continue
+            # Pattern 2: pure text overflow (no valid currency amount at all)
+            if not re.match(r"^[\d,.]+$", val):
+                result["Description"] = (result.get("Description", "") + " " + val).strip()
+                result[num_col] = ""
+
         return result
 
-    def _parse_transactions(
+    def _parse_page_transactions(
         self,
         lines: list[str],
         header_idx: int,
         bounds: dict[str, tuple[int, int]],
     ) -> list[dict]:
-        """Parse transaction rows from lines below the header."""
+        """Parse transaction rows from lines below the header on a single page."""
         rows: list[dict] = []
-        # Start from line after header
         for i in range(header_idx + 1, len(lines)):
             line = lines[i]
             stripped = line.strip()
@@ -136,11 +177,10 @@ class TextBasedExtractor:
             sliced = self._slice_line(line, bounds)
 
             # Stop at Closing Balance
-            if re.search(r"Closing\s*Balance", sliced.get("Description", ""), re.I):
+            desc = sliced.get("Description", "")
+            if re.search(r"Closing\s*Balance", desc, re.I):
                 rows.append(sliced)
                 break
-
-            # Also check if the keyword spans columns
             if re.search(r"Closing\s*Balance", stripped, re.I):
                 rows.append(sliced)
                 break
@@ -182,10 +222,28 @@ class TextBasedExtractor:
         return summary
 
     @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normalize layout-text artifacts: fix missing spaces in dates and descriptions.
+
+        Layout text from pdfplumber often has concatenated words (e.g. '14Oct',
+        'TermLoan', 'HydroBillPmt') due to tight character spacing in the PDF.
+        """
+        # Fix date: digit immediately followed by month name → insert space
+        text = re.sub(r"(\d)(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", r"\1 \2", text)
+        # Fix camelCase-like concatenation: lowercase→Uppercase
+        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        # Fix digit→Uppercase (2+ chars): "9CGSX9" should stay, but "298TOYOTA" → "298 TOYOTA"
+        text = re.sub(r"(\d)([A-Z]{2})", r"\1 \2", text)
+        # Collapse multiple spaces
+        text = re.sub(r"  +", " ", text)
+        return text.strip()
+
+    @staticmethod
     def _build_dataframe(rows: list[dict]) -> pd.DataFrame:
         """Build DataFrame with the same post-processing pipeline as Source A.
 
-        Applies: noise filtering, continuation-line merging, date forward-fill.
+        Applies: noise filtering, continuation-line merging, date forward-fill,
+        text normalization.
         This MUST stay in sync with BankStatementParser._build_dataframe.
         """
         if not rows:
@@ -254,8 +312,10 @@ class TextBasedExtractor:
             else:
                 row["Date"] = last_date
 
-        # Clean up whitespace
+        # Normalize text artifacts from layout extraction
         for row in merged:
+            row["Date"] = TextBasedExtractor._normalize_text(row["Date"])
+            row["Description"] = TextBasedExtractor._normalize_text(row["Description"])
             row["Description"] = re.sub(r"  +", " ", row["Description"])
             row["Date"] = re.sub(r"  +", " ", row["Date"])
 

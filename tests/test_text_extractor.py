@@ -74,6 +74,80 @@ class TestSliceLine:
         assert result["Balance"] == ""
 
 
+class TestSliceLineOverflow:
+    """Test that text overflow from Description into numeric columns is fixed."""
+
+    def test_text_overflow_into_withdrawals(self, extractor):
+        """E.g. 'ZR 41.59' in Withdrawals → Description gets 'ZR', Withdrawals gets '41.59'."""
+        bounds = {
+            "Date": (0, 10),
+            "Description": (10, 40),
+            "Withdrawals": (40, 55),
+            "Deposits": (55, 70),
+            "Balance": (70, 120),
+        }
+        line = "Jan 01    Some Description                ZR 41.59"
+        result = extractor._slice_line(line, bounds)
+        assert result["Withdrawals"] == "41.59"
+        assert "ZR" in result["Description"]
+
+    def test_numeric_code_overflow(self, extractor):
+        """E.g. '742 300.00' in Withdrawals → Description gets '742', Withdrawals gets '300.00'."""
+        bounds = {
+            "Date": (0, 10),
+            "Description": (10, 40),
+            "Withdrawals": (40, 55),
+            "Deposits": (55, 70),
+            "Balance": (70, 120),
+        }
+        line = "Jan 01    Online Transfer Account        742 300.00"
+        result = extractor._slice_line(line, bounds)
+        assert result["Withdrawals"] == "300.00"
+        assert "742" in result["Description"]
+
+    def test_pure_text_overflow(self, extractor):
+        """E.g. 'SINC' in Withdrawals (no amount) → moved to Description."""
+        bounds = {
+            "Date": (0, 10),
+            "Description": (10, 40),
+            "Withdrawals": (40, 55),
+            "Deposits": (55, 70),
+            "Balance": (70, 120),
+        }
+        line = "Jan 01    CAERUS ENTERPRI               SINC"
+        result = extractor._slice_line(line, bounds)
+        assert result["Withdrawals"] == ""
+        assert "SINC" in result["Description"]
+
+    def test_normal_amount_not_modified(self, extractor):
+        """Normal numeric values should not be treated as overflow."""
+        bounds = {
+            "Date": (0, 10),
+            "Description": (10, 40),
+            "Withdrawals": (40, 55),
+            "Deposits": (55, 70),
+            "Balance": (70, 120),
+        }
+        line = "Jan 01    Payment                        100.00"
+        result = extractor._slice_line(line, bounds)
+        assert result["Withdrawals"] == "100.00"
+
+
+class TestFindHeaderMidpointBoundary:
+    """Test that Balance column boundary uses midpoint for right-aligned values."""
+
+    def test_balance_boundary_uses_midpoint(self, extractor):
+        lines = [
+            "  Date   Description                    Withdrawals($) Deposits($)       Balance($)",
+        ]
+        idx, bounds = extractor._find_header(lines)
+        # Balance should start before the "Balance" keyword position (73)
+        # because of the midpoint adjustment between Deposits end and Balance start
+        assert bounds["Balance"][0] < 73
+        # Deposits should end at the same position where Balance starts
+        assert bounds["Deposits"][1] == bounds["Balance"][0]
+
+
 class TestBuildDataframe:
     def test_empty_rows(self, extractor):
         df = extractor._build_dataframe([])
