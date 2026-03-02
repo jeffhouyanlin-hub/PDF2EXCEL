@@ -6,7 +6,14 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from core.verifier import DataVerifier, VerificationResult, _normalize
+from core.verifier import (
+    ArithmeticChecker,
+    DataVerifier,
+    TripleVerificationResult,
+    TripleVerifier,
+    VerificationResult,
+    _normalize,
+)
 
 
 @pytest.fixture
@@ -129,3 +136,246 @@ class TestRowCountMismatch:
 
         assert result.matched is False
         assert result.mismatched_cells >= 1
+
+
+# --- ArithmeticChecker tests ---
+
+class TestArithmeticChecker:
+    @pytest.fixture
+    def checker(self):
+        return ArithmeticChecker()
+
+    def test_parse_amount(self, checker):
+        assert checker._parse_amount("2,788.09") == 2788.09
+        assert checker._parse_amount("$1,000.00") == 1000.0
+        assert checker._parse_amount("") == 0.0
+        assert checker._parse_amount(None) == 0.0
+        assert checker._parse_amount("abc") == 0.0
+
+    def test_balance_continuity_pass(self, checker):
+        df = pd.DataFrame({
+            "Date": ["Jan 01", "Jan 02"],
+            "Description": ["Deposit", "Withdrawal"],
+            "Withdrawals": ["", "50.00"],
+            "Deposits": ["100.00", ""],
+            "Balance": ["1100.00", "1050.00"],
+        })
+        issues = checker._check_balance_continuity(df, opening=1000.0)
+        assert len(issues) == 0
+
+    def test_balance_continuity_fail(self, checker):
+        df = pd.DataFrame({
+            "Date": ["Jan 01"],
+            "Description": ["Payment"],
+            "Withdrawals": ["100.00"],
+            "Deposits": [""],
+            "Balance": ["800.00"],  # should be 900
+        })
+        issues = checker._check_balance_continuity(df, opening=1000.0)
+        assert len(issues) == 1
+        assert issues[0].check == "balance_continuity"
+        assert issues[0].row == 0
+
+    def test_withdrawal_total_pass(self, checker):
+        df = pd.DataFrame({
+            "Withdrawals": ["100.00", "200.00", ""],
+        })
+        summary = {"total_withdrawals": "300.00"}
+        issue = checker._check_withdrawal_total(df, summary)
+        assert issue is None
+
+    def test_withdrawal_total_fail(self, checker):
+        df = pd.DataFrame({
+            "Withdrawals": ["100.00", "200.00"],
+        })
+        summary = {"total_withdrawals": "500.00"}
+        issue = checker._check_withdrawal_total(df, summary)
+        assert issue is not None
+        assert issue.check == "withdrawal_total"
+
+    def test_deposit_total_pass(self, checker):
+        df = pd.DataFrame({
+            "Deposits": ["500.00", "300.00"],
+        })
+        summary = {"total_deposits": "800.00"}
+        issue = checker._check_deposit_total(df, summary)
+        assert issue is None
+
+    def test_deposit_total_fail(self, checker):
+        df = pd.DataFrame({
+            "Deposits": ["500.00"],
+        })
+        summary = {"total_deposits": "999.00"}
+        issue = checker._check_deposit_total(df, summary)
+        assert issue is not None
+
+    def test_closing_balance_pass(self, checker):
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "1300.00",
+            "total_deposits": "500.00",
+            "total_withdrawals": "200.00",
+        }
+        issue = checker._check_closing_balance(summary)
+        assert issue is None
+
+    def test_closing_balance_fail(self, checker):
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "9999.00",
+            "total_deposits": "500.00",
+            "total_withdrawals": "200.00",
+        }
+        issue = checker._check_closing_balance(summary)
+        assert issue is not None
+        assert issue.check == "closing_balance"
+
+    def test_full_check_all_pass(self, checker):
+        df = pd.DataFrame({
+            "Date": ["Jan 01", "Jan 02"],
+            "Description": ["Deposit", "Withdrawal"],
+            "Withdrawals": ["", "200.00"],
+            "Deposits": ["500.00", ""],
+            "Balance": ["1500.00", "1300.00"],
+        })
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "1300.00",
+            "total_deposits": "500.00",
+            "total_withdrawals": "200.00",
+        }
+        issues = checker.check(df, summary)
+        assert len(issues) == 0
+
+
+# --- TripleVerifier tests ---
+
+class TestTripleVerifier:
+    def test_all_sources_identical(self, tmp_path):
+        df = pd.DataFrame({
+            "Date": ["Jan 01"],
+            "Description": ["Deposit"],
+            "Withdrawals": [""],
+            "Deposits": ["500.00"],
+            "Balance": ["1500.00"],
+        })
+        excel_path = tmp_path / "stmt.xlsx"
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            pd.DataFrame({"Item": ["Bank"], "Value": ["Test"]}).to_excel(
+                writer, sheet_name="Summary", index=False,
+            )
+            df.to_excel(writer, sheet_name="Transactions", index=False)
+
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "1500.00",
+            "total_deposits": "500.00",
+            "total_withdrawals": "0",
+        }
+        result = TripleVerifier().verify_statement(
+            source_a=df, source_b=df, excel_path=excel_path, summary=summary,
+        )
+        assert result.overall_passed is True
+        assert result.matched is True
+        assert len(result.layers) == 3
+        assert all(l.passed for l in result.layers)
+
+    def test_source_b_differs(self, tmp_path):
+        source_a = pd.DataFrame({
+            "Date": ["Jan 01"],
+            "Description": ["Deposit"],
+            "Withdrawals": [""],
+            "Deposits": ["500.00"],
+            "Balance": ["1500.00"],
+        })
+        source_b = pd.DataFrame({
+            "Date": ["Jan 01"],
+            "Description": ["Deposit"],
+            "Withdrawals": [""],
+            "Deposits": ["999.00"],  # different
+            "Balance": ["1500.00"],
+        })
+        excel_path = tmp_path / "stmt.xlsx"
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            pd.DataFrame({"Item": ["Bank"], "Value": ["Test"]}).to_excel(
+                writer, sheet_name="Summary", index=False,
+            )
+            source_a.to_excel(writer, sheet_name="Transactions", index=False)
+
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "1500.00",
+            "total_deposits": "500.00",
+            "total_withdrawals": "0",
+        }
+        result = TripleVerifier().verify_statement(
+            source_a=source_a, source_b=source_b,
+            excel_path=excel_path, summary=summary,
+        )
+        assert result.overall_passed is False
+        # Layer 1 (A vs B) should fail
+        assert result.layers[0].passed is False
+        assert result.layers[0].mismatched_cells > 0
+        # Layer 2 (A vs C) should pass
+        assert result.layers[1].passed is True
+
+    def test_empty_source_b_skips_layer1(self, tmp_path):
+        source_a = pd.DataFrame({
+            "Date": ["Jan 01"],
+            "Description": ["Payment"],
+            "Withdrawals": ["100.00"],
+            "Deposits": [""],
+            "Balance": ["900.00"],
+        })
+        excel_path = tmp_path / "stmt.xlsx"
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            pd.DataFrame({"Item": ["Bank"], "Value": ["Test"]}).to_excel(
+                writer, sheet_name="Summary", index=False,
+            )
+            source_a.to_excel(writer, sheet_name="Transactions", index=False)
+
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "900.00",
+            "total_deposits": "0",
+            "total_withdrawals": "100.00",
+        }
+        result = TripleVerifier().verify_statement(
+            source_a=source_a, source_b=pd.DataFrame(),
+            excel_path=excel_path, summary=summary,
+        )
+        # Layer 1 should be skipped
+        assert result.layers[0].skipped is True
+        # Other layers should pass
+        assert result.layers[1].passed is True
+        assert result.layers[2].passed is True
+
+    def test_arithmetic_failure(self, tmp_path):
+        source_a = pd.DataFrame({
+            "Date": ["Jan 01"],
+            "Description": ["Deposit"],
+            "Withdrawals": [""],
+            "Deposits": ["500.00"],
+            "Balance": ["1500.00"],
+        })
+        excel_path = tmp_path / "stmt.xlsx"
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            pd.DataFrame({"Item": ["Bank"], "Value": ["Test"]}).to_excel(
+                writer, sheet_name="Summary", index=False,
+            )
+            source_a.to_excel(writer, sheet_name="Transactions", index=False)
+
+        summary = {
+            "opening_balance": "1000.00",
+            "closing_balance": "9999.00",  # wrong!
+            "total_deposits": "500.00",
+            "total_withdrawals": "0",
+        }
+        result = TripleVerifier().verify_statement(
+            source_a=source_a, source_b=source_a,
+            excel_path=excel_path, summary=summary,
+        )
+        assert result.overall_passed is False
+        # Layer 3 (arithmetic) should fail
+        assert result.layers[2].passed is False
+        assert len(result.layers[2].arithmetic_issues) > 0

@@ -41,6 +41,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;f
 .bdg{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-right:4px}
 .bdg.g{background:#d1fae5;color:#065f46}
 .bdg.r{background:#fee2e2;color:#991b1b}
+.bdg.y{background:#fef3c7;color:#92400e}
+.lyr{display:inline-flex;align-items:center;gap:3px;margin-right:10px;font-size:11px;padding:2px 8px;border-radius:4px;border:1px solid #dee2e6;background:#fff}
+.lyr.pass{border-color:#86efac;background:#f0fdf4}
+.lyr.fail{border-color:#fca5a5;background:#fef2f2}
+.lyr.skip{border-color:#fcd34d;background:#fffbeb}
 </style></head><body>
 <div id="app">
 <div id="ctrl">
@@ -104,10 +109,23 @@ el.innerHTML=h;
 if(PB){document.getElementById('pif').src='data:application/pdf;base64,'+PB+'#navpanes=0&toolbar=1&view=FitH';}
 
 /* === Status bar === */
-document.getElementById('sts2').innerHTML=
+(function(){
+var stt=document.getElementById('stt'), sts2=document.getElementById('sts2');
+var lyrHtml='';
+if(D.layers && D.layers.length>0){
+  for(var li=0;li<D.layers.length;li++){
+    var ly=D.layers[li];
+    var cls=ly.skipped?'skip':(ly.passed?'pass':'fail');
+    var icon=ly.skipped?'\u23ed':(ly.passed?'\u2713':'\u2717');
+    var extra=(!ly.passed&&!ly.skipped&&ly.mismatched>0)?' ('+ly.mismatched+')':'';
+    lyrHtml+='<span class="lyr '+cls+'">'+icon+' '+esc(ly.label)+extra+'</span>';
+  }
+}
+sts2.innerHTML=lyrHtml+
   '<span class="bdg g">\u2713 '+D.matched+'</span>'+
   '<span class="bdg r">\u2717 '+D.mismatched+'</span>'+
   ' \u5171/Total: '+D.total;
+})();
 document.getElementById('ctr').textContent='0 / '+D.total;
 document.getElementById('stt').textContent='\u5c31\u7eea / Ready';
 

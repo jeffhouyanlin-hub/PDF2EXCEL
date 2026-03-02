@@ -18,7 +18,15 @@ from core.batch import BatchProcessor
 from core.converter import ExcelConverter
 from core.extractor import PDFExtractor
 from core.statement_parser import BankStatementParser, RowPosition
-from core.verifier import DataVerifier, _normalize
+from core.text_extractor import TextBasedExtractor
+from core.verifier import (
+    ArithmeticIssue,
+    DataVerifier,
+    LayerResult,
+    TripleVerificationResult,
+    TripleVerifier,
+    _normalize,
+)
 
 st.set_page_config(page_title="PDF2EXCEL", page_icon="📊", layout="wide")
 
@@ -71,7 +79,7 @@ with st.sidebar:
     sheet_per_table = sheet_mode == "每个表格一个 Sheet"
     max_workers = st.slider("并行线程数 / Parallel Threads", 1, 8, 4)
     st.divider()
-    st.caption("© Dr. Jeff Hou · v0.3.0")
+    st.caption("© Dr. Jeff Hou · v0.4.0")
     if st.button("📮 报错反馈 / Error Feedback", use_container_width=True):
         st.session_state.show_feedback = True
     if st.button("🔍 数据复核 / Data Verification", use_container_width=True):
@@ -148,6 +156,7 @@ def _build_verification_payload(
     row_headers: list[str],
     is_statement: bool,
     summary_positions: list | None = None,
+    layers: list[LayerResult] | None = None,
 ) -> dict:
     """Build data payload for the dual-panel verification component.
 
@@ -211,6 +220,27 @@ def _build_verification_payload(
             else:
                 sum_positions.append(None)
 
+    # Build layers info for triple verification status bar
+    layers_data = []
+    if layers:
+        for layer in layers:
+            ld: dict = {
+                "name": layer.name,
+                "label": layer.label,
+                "passed": layer.passed,
+                "skipped": layer.skipped,
+                "total_cells": layer.total_cells,
+                "mismatched": layer.mismatched_cells,
+            }
+            if layer.arithmetic_issues:
+                ld["arithmetic"] = [
+                    {"check": ai.check, "row": ai.row,
+                     "expected": ai.expected, "actual": ai.actual,
+                     "message": ai.message}
+                    for ai in layer.arithmetic_issues
+                ]
+            layers_data.append(ld)
+
     return {
         "segments": segments,
         "rows": rows,
@@ -221,6 +251,7 @@ def _build_verification_payload(
         "total": len(unified_rows),
         "matched": sum(1 for r in rows if r["ok"]),
         "mismatched": sum(1 for r in rows if not r["ok"]),
+        "layers": layers_data,
     }
 
 
@@ -378,10 +409,14 @@ if st.session_state.get("show_verification"):
         except Exception:
             _summary_positions = None
 
+    # Extract layers if TripleVerificationResult
+    _v_layers = getattr(_v_result, "layers", None)
+
     # Build payload for dual-panel verification component
     _payload = _build_verification_payload(
         _unified_rows, _row_positions, _row_headers, _is_statement,
         summary_positions=_summary_positions,
+        layers=_v_layers,
     )
     _payload_json = json.dumps(_payload, ensure_ascii=False)
 
@@ -391,11 +426,34 @@ if st.session_state.get("show_verification"):
 
     st.divider()
 
-    # 验证结果汇总
-    if _v_result.matched:
-        st.success(f"✅ {_v_result.message}")
+    # 验证结果汇总 — 三层状态
+    if _v_layers:
+        _layer_cols = st.columns(len(_v_layers) + 1)
+        for _li, _layer in enumerate(_v_layers):
+            with _layer_cols[_li]:
+                if _layer.skipped:
+                    st.info(f"⏭ {_layer.label}: 跳过 / Skipped")
+                elif _layer.passed:
+                    st.success(f"✅ {_layer.label}")
+                else:
+                    st.error(f"❌ {_layer.label} ({_layer.mismatched_cells})")
+        with _layer_cols[-1]:
+            if _v_result.matched:
+                st.success(f"✅ {_v_result.message}")
+            else:
+                st.warning(f"⚠️ {_v_result.message}")
+
+        # Arithmetic issues detail
+        _arith_layer = next((l for l in _v_layers if l.name == "arithmetic"), None)
+        if _arith_layer and _arith_layer.arithmetic_issues:
+            with st.expander(f"🔢 算术校验详情 / Arithmetic Details ({len(_arith_layer.arithmetic_issues)})"):
+                for _ai in _arith_layer.arithmetic_issues:
+                    st.warning(f"• {_ai.message}")
     else:
-        st.warning(f"⚠️ {_v_result.message}")
+        if _v_result.matched:
+            st.success(f"✅ {_v_result.message}")
+        else:
+            st.warning(f"⚠️ {_v_result.message}")
 
     # 差异列表
     if _v_result.diffs:
@@ -554,6 +612,8 @@ with tabs[1]:
     if st.button("开始转换 / Start", type="primary", use_container_width=True):
         progress_bar = st.progress(0, text="准备中... / Preparing...")
         _verifier = DataVerifier()
+        _triple_verifier = TripleVerifier()
+        _text_extractor = TextBasedExtractor()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             input_dir = Path(tmpdir) / "input"
@@ -584,12 +644,29 @@ with tabs[1]:
 
                     if stmt_info and not stmt_info.transactions.empty:
                         _statement_to_excel(stmt_info, out_path)
-                        # 自动验证
-                        v_result = _verifier.verify_statement(
-                            stmt_info.transactions, out_path
-                        )
                         # 获取行坐标
                         row_headers, row_positions = statement_parser.get_row_positions(pdf_path)
+                        # Summary fields for arithmetic checks
+                        summary_dict = {
+                            "opening_balance": stmt_info.opening_balance,
+                            "closing_balance": stmt_info.closing_balance,
+                            "total_deposits": stmt_info.total_deposits,
+                            "total_withdrawals": stmt_info.total_withdrawals,
+                        }
+                        # Source B: text-based extraction (with fallback)
+                        source_b_df = pd.DataFrame()
+                        try:
+                            text_result = _text_extractor.extract(pdf_path)
+                            source_b_df = text_result.transactions
+                        except Exception:
+                            pass  # Layer 1 will be marked as skipped
+                        # Triple verification
+                        v_result = _triple_verifier.verify_statement(
+                            source_a=stmt_info.transactions,
+                            source_b=source_b_df,
+                            excel_path=out_path,
+                            summary=summary_dict,
+                        )
                         # Summary 字段: PDF 解析的原始值
                         summary_pdf_vals = {
                             "Bank Name": stmt_info.bank_name,
@@ -610,6 +687,7 @@ with tabs[1]:
                             "row_positions": row_positions,
                             "row_headers": row_headers,
                             "summary_pdf_vals": summary_pdf_vals,
+                            "source_b_df": source_b_df,
                         }
                     elif tables:
                         from core.extractor import ExtractionResult
@@ -656,8 +734,8 @@ with tabs[1]:
                 total_diffs = sum(v["result"].mismatched_cells for v in verify_files.values())
                 if all_matched:
                     st.success(
-                        "✅ 数据审核通过，EXCEL文件与PDF文件内容一致 / "
-                        "Verification passed, Excel matches PDF"
+                        "✅ 三源交叉验证全部通过 / "
+                        "All three verification layers passed"
                     )
                 else:
                     st.warning(
