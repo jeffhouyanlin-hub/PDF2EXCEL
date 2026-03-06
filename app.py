@@ -74,13 +74,13 @@ with st.sidebar:
     sheet_mode = st.radio(
         "Sheet 策略 / Sheet Strategy",
         list(_SHEET_LABELS.keys()),
-        index=0,
+        index=1,
         format_func=lambda x: _SHEET_LABELS[x],
     )
     sheet_per_table = sheet_mode == "每个表格一个 Sheet"
     max_workers = st.slider("并行线程数 / Parallel Threads", 1, 15, 4)
     st.divider()
-    st.caption("© Dr. Jeff Hou · v0.4.4")
+    st.caption("© Dr. Jeff Hou · v0.5.0")
     if st.button("📮 报错反馈 / Error Feedback", use_container_width=True):
         st.session_state.show_feedback = True
     if st.button("🔍 数据复核 / Data Verification", use_container_width=True):
