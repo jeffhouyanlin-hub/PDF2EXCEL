@@ -907,8 +907,11 @@ def _build_merged_transactions(
         all_rows.append(ob_row)
         row_mapping.append((stem, -1))
 
-        # --- Transaction rows (preserve original order) ---
+        # --- Transaction rows (preserve original order, skip duplicate Opening Balance) ---
         for orig_idx in range(len(txn_df)):
+            desc = str(txn_df.iloc[orig_idx].get("Description", "")) if "Description" in txn_df.columns else ""
+            if re.search(r"Opening\s*Balance", desc, re.I):
+                continue
             row_data = {c: "" for c in cols}
             row_data["Statement"] = stem
             for c in cols:
