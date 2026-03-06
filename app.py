@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import tempfile
 import zipfile
 from pathlib import Path
@@ -77,7 +78,7 @@ with st.sidebar:
         format_func=lambda x: _SHEET_LABELS[x],
     )
     sheet_per_table = sheet_mode == "每个表格一个 Sheet"
-    max_workers = st.slider("并行线程数 / Parallel Threads", 1, 8, 4)
+    max_workers = st.slider("并行线程数 / Parallel Threads", 1, 15, 4)
     st.divider()
     st.caption("© Dr. Jeff Hou · v0.4.4")
     if st.button("📮 报错反馈 / Error Feedback", use_container_width=True):
@@ -585,6 +586,87 @@ def _statement_to_excel(info, output_path: Path) -> Path:
     return output_path
 
 
+def _extract_year_from_period(period_str: str) -> int | None:
+    """Extract 4-digit year from period string like 'November 1, 2024'."""
+    if not period_str:
+        return None
+    m = re.search(r"(20\d{2})", period_str)
+    return int(m.group(1)) if m else None
+
+
+def _build_merged_transactions(
+    all_txns: list[tuple[str, pd.DataFrame, object]],
+    output_dir: Path,
+) -> Path | None:
+    """Merge all statement transactions into one sorted Excel file.
+
+    Args:
+        all_txns: [(pdf_stem, transactions_df, stmt_info), ...]
+        output_dir: output directory
+    Returns:
+        Path to merged Excel, or None.
+    """
+    if not all_txns:
+        return None
+
+    frames = []
+    bank_name = ""
+    account = ""
+    period_starts: list[pd.Timestamp] = []
+    period_ends: list[pd.Timestamp] = []
+
+    for pdf_stem, txn_df, info in all_txns:
+        df = txn_df.copy()
+        df.insert(0, "Statement", pdf_stem)
+
+        # Add year context for date sorting
+        year = (_extract_year_from_period(info.period_from)
+                or _extract_year_from_period(info.period_to)
+                or pd.Timestamp.now().year)
+        df["_sort_date"] = df["Date"].apply(
+            lambda d, y=year: pd.to_datetime(
+                f"{d} {y}" if d and str(d).strip() and not re.search(r"\b20\d{2}\b", str(d)) else str(d),
+                errors="coerce",
+            )
+        )
+        frames.append(df)
+
+        if info.bank_name and not bank_name:
+            bank_name = info.bank_name
+        if info.account_number and not account:
+            account = info.account_number
+        dt_from = pd.to_datetime(info.period_from, errors="coerce") if info.period_from else pd.NaT
+        if pd.notna(dt_from):
+            period_starts.append(dt_from)
+        dt_to = pd.to_datetime(info.period_to, errors="coerce") if info.period_to else pd.NaT
+        if pd.notna(dt_to):
+            period_ends.append(dt_to)
+
+    merged = pd.concat(frames, ignore_index=True)
+    merged.sort_values("_sort_date", inplace=True, na_position="first")
+    merged.drop(columns=["_sort_date"], inplace=True)
+    merged.reset_index(drop=True, inplace=True)
+
+    # Filename: BankName_Last4_StartDate-EndDate.xlsx
+    bank_short = bank_name.replace(" ", "") if bank_name else "Bank"
+    last4 = account[-4:] if len(account) >= 4 else (account or "0000")
+    d_start = min(period_starts).strftime("%Y%m%d") if period_starts else "start"
+    d_end = max(period_ends).strftime("%Y%m%d") if period_ends else "end"
+    filename = f"{bank_short}_{last4}_{d_start}-{d_end}.xlsx"
+
+    out_path = output_dir / filename
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        merged.to_excel(writer, sheet_name="Transactions", index=False)
+        ws = writer.sheets["Transactions"]
+        for col_idx, col_name in enumerate(merged.columns, 1):
+            max_len = len(str(col_name))
+            for val in merged.iloc[:, col_idx - 1]:
+                max_len = max(max_len, len(str(val)) if val is not None else 0)
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 55)
+
+    return out_path
+
+
 # --- 预览 & 转换 / Preview & Convert ---
 tabs = st.tabs(["📋 预览 / Preview", "⚡ 批量转换 / Batch Convert"])
 
@@ -657,6 +739,7 @@ with tabs[1]:
             failed = 0
             errors: list[str] = []
             verify_files: dict = {}
+            merge_txn_data: list = []
 
             for i, pdf_path in enumerate(pdf_paths):
                 try:
@@ -711,6 +794,8 @@ with tabs[1]:
                             "summary_pdf_vals": summary_pdf_vals,
                             "source_b_df": source_b_df,
                         }
+                        if not sheet_per_table:
+                            merge_txn_data.append((pdf_path.stem, stmt_info.transactions, stmt_info))
                     elif tables:
                         from core.extractor import ExtractionResult
                         result = ExtractionResult(tables=tables, page_count=0, source=str(pdf_path))
@@ -734,6 +819,11 @@ with tabs[1]:
                     failed += 1
 
                 progress_bar.progress((i + 1) / total, text=f"处理中... / Processing {i + 1}/{total}")
+
+            # Merge mode: combine all statement transactions
+            merged_excel_path: Path | None = None
+            if not sheet_per_table and merge_txn_data:
+                merged_excel_path = _build_merged_transactions(merge_txn_data, output_dir)
 
             progress_bar.progress(1.0, text="完成！/ Done!")
 
@@ -765,26 +855,36 @@ with tabs[1]:
                         f"Found {total_diffs} mismatch(es), click 'Data Verification' in sidebar for details"
                     )
 
-            excel_files = list(output_dir.glob("*.xlsx"))
-            if excel_files:
-                if len(excel_files) == 1:
-                    with open(excel_files[0], "rb") as f:
-                        st.download_button(
-                            "下载 Excel / Download",
-                            f.read(),
-                            file_name=excel_files[0].name,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                        )
-                else:
-                    buf = io.BytesIO()
-                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for ef in excel_files:
-                            zf.write(ef, ef.name)
+            if merged_excel_path:
+                with open(merged_excel_path, "rb") as f:
                     st.download_button(
-                        f"下载全部 / Download All ({len(excel_files)} files, ZIP)",
-                        buf.getvalue(),
-                        file_name="pdf2excel_output.zip",
-                        mime="application/zip",
+                        "下载合并 Excel / Download Merged",
+                        f.read(),
+                        file_name=merged_excel_path.name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+            else:
+                excel_files = list(output_dir.glob("*.xlsx"))
+                if excel_files:
+                    if len(excel_files) == 1:
+                        with open(excel_files[0], "rb") as f:
+                            st.download_button(
+                                "下载 Excel / Download",
+                                f.read(),
+                                file_name=excel_files[0].name,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                            )
+                    else:
+                        buf = io.BytesIO()
+                        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for ef in excel_files:
+                                zf.write(ef, ef.name)
+                        st.download_button(
+                            f"下载全部 / Download All ({len(excel_files)} files, ZIP)",
+                            buf.getvalue(),
+                            file_name="pdf2excel_output.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                        )
