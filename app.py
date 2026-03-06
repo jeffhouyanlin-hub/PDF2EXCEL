@@ -262,6 +262,91 @@ def _build_verification_html(payload_json: str, pdf_b64: str) -> str:
     return tpl.replace('"__PAYLOAD__"', payload_json).replace("__PDF_B64__", pdf_b64)
 
 
+def _build_merged_verification_payload(
+    merged_excel_bytes: bytes,
+    row_mapping: list[tuple[str, int]],
+    verify_files: dict,
+) -> dict:
+    """Build payload for the merged verification component.
+
+    For each row in the merged Excel, maps back to the source PDF's
+    transaction data for comparison, using row_mapping.
+    """
+    xls = pd.ExcelFile(io.BytesIO(merged_excel_bytes))
+    edf = pd.read_excel(xls, sheet_name="Transactions")
+    cols = list(edf.columns)
+
+    segments = [{"sheet": "Transactions", "columns": cols, "startIdx": 0, "endIdx": len(edf)}]
+    rows = []
+
+    for i in range(len(edf)):
+        ev = {}
+        for c in cols:
+            raw = str(edf.iloc[i][c]) if str(edf.iloc[i][c]) != "nan" else ""
+            ev[c] = raw
+
+        # Map back to source PDF data
+        stmt_key, orig_idx = row_mapping[i] if i < len(row_mapping) else ("", 0)
+        pv = dict(ev)  # default: same as Excel
+
+        vf = verify_files.get(stmt_key)
+        if vf and vf.get("expected_dfs"):
+            pdf_df = vf["expected_dfs"][0]
+            if orig_idx < len(pdf_df):
+                for c in cols:
+                    if c == "Statement":
+                        continue
+                    if c in pdf_df.columns:
+                        raw_p = str(pdf_df.iloc[orig_idx][c])
+                        pv[c] = "" if raw_p == "nan" else raw_p
+
+        # Diff detection (skip Statement column)
+        diff_cols = []
+        for ci, c in enumerate(cols):
+            if c == "Statement":
+                continue
+            if _normalize(pv.get(c, "")) != _normalize(ev.get(c, "")):
+                diff_cols.append(ci)
+
+        # PDF position
+        pos = None
+        if vf:
+            positions = vf.get("row_positions", [])
+            if orig_idx < len(positions):
+                rp = positions[orig_idx]
+                pos = {
+                    "pg": rp.page_index,
+                    "yt": round(rp.y_top, 1),
+                    "yb": round(rp.y_bottom, 1),
+                    "ph": round(rp.page_height, 1),
+                }
+
+        rows.append({
+            "seg": 0,
+            "ev": [ev.get(c, "") for c in cols],
+            "pv": [pv.get(c, "") for c in cols],
+            "ok": len(diff_cols) == 0,
+            "dc": diff_cols,
+            "stmtKey": stmt_key,
+            "pos": pos,
+        })
+
+    return {
+        "isMerged": True,
+        "segments": segments,
+        "rows": rows,
+        "total": len(rows),
+        "matched": sum(1 for r in rows if r["ok"]),
+        "mismatched": sum(1 for r in rows if not r["ok"]),
+    }
+
+
+def _build_merged_verification_html(payload_json: str, pdfs_map_json: str) -> str:
+    """Build HTML for the merged multi-PDF verification component."""
+    tpl = (Path(__file__).parent / "templates" / "verification_merged.html").read_text(encoding="utf-8")
+    return tpl.replace('"__PAYLOAD__"', payload_json).replace('"__PDFS_MAP__"', pdfs_map_json)
+
+
 # --- 数据复核页面 / Verification Page ---
 if st.session_state.get("show_verification"):
     # 全屏模式：隐藏侧边栏
@@ -283,6 +368,54 @@ if st.session_state.get("show_verification"):
         if st.button("返回 / Back", key="verify_back_empty"):
             st.session_state.show_verification = False
             st.rerun()
+        st.stop()
+
+    # === Merged mode verification ===
+    _merged_data = _vdata.get("merged")
+    if _merged_data and _merged_data.get("is_merged"):
+        _m_hdr = st.columns([5, 2, 1.5])
+        with _m_hdr[0]:
+            st.subheader("🔍 合并数据复核 / Merged Data Verification")
+        with _m_hdr[1]:
+            st.download_button(
+                "⬇ 下载合并 Excel / Download",
+                _merged_data["merged_excel_bytes"],
+                file_name=f"{_merged_data['merged_filename']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="verify_download_merged",
+            )
+        with _m_hdr[2]:
+            if st.button("↩ 返回 / Back", key="verify_back_merged", use_container_width=True):
+                st.session_state.show_verification = False
+                st.rerun()
+
+        # Build merged payload
+        _m_payload = _build_merged_verification_payload(
+            _merged_data["merged_excel_bytes"],
+            _merged_data["row_mapping"],
+            _vdata["files"],
+        )
+        _m_payload_json = json.dumps(_m_payload, ensure_ascii=False)
+
+        # Build PDFs map (stem → base64)
+        _m_pdfs_map = {}
+        for _stem, _pdf_bytes in _merged_data["pdf_map"].items():
+            _m_pdfs_map[_stem] = base64.b64encode(_pdf_bytes).decode()
+        _m_pdfs_json = json.dumps(_m_pdfs_map, ensure_ascii=False)
+
+        # Render merged verification component
+        _m_html = _build_merged_verification_html(_m_payload_json, _m_pdfs_json)
+        stc.html(_m_html, height=720, scrolling=False)
+
+        st.divider()
+        _m_matched = _m_payload["matched"]
+        _m_mismatched = _m_payload["mismatched"]
+        if _m_mismatched == 0:
+            st.success(f"✅ 全部 {_m_payload['total']} 条交易核对一致 / All {_m_payload['total']} transactions matched")
+        else:
+            st.warning(f"⚠️ 发现 {_m_mismatched} 处不一致 / Found {_m_mismatched} mismatch(es)")
+
         st.stop()
 
     # --- Header row: title | file selector | download | back ---
@@ -597,14 +730,16 @@ def _extract_year_from_period(period_str: str) -> int | None:
 def _build_merged_transactions(
     all_txns: list[tuple[str, pd.DataFrame, object]],
     output_dir: Path,
-) -> Path | None:
+) -> tuple[Path, list[tuple[str, int]]] | None:
     """Merge all statement transactions into one sorted Excel file.
 
     Args:
         all_txns: [(pdf_stem, transactions_df, stmt_info), ...]
         output_dir: output directory
     Returns:
-        Path to merged Excel, or None.
+        (path_to_excel, row_mapping) where row_mapping is
+        [(statement_stem, original_row_index), ...] for each merged row,
+        or None if no data.
     """
     if not all_txns:
         return None
@@ -618,6 +753,7 @@ def _build_merged_transactions(
     for pdf_stem, txn_df, info in all_txns:
         df = txn_df.copy()
         df.insert(0, "Statement", pdf_stem)
+        df["_orig_idx"] = range(len(df))
 
         # Add year context for date sorting
         year = (_extract_year_from_period(info.period_from)
@@ -644,7 +780,9 @@ def _build_merged_transactions(
 
     merged = pd.concat(frames, ignore_index=True)
     merged.sort_values("_sort_date", inplace=True, na_position="first")
-    merged.drop(columns=["_sort_date"], inplace=True)
+    # Extract row mapping before dropping helper columns
+    row_mapping = list(zip(merged["Statement"], merged["_orig_idx"].astype(int)))
+    merged.drop(columns=["_sort_date", "_orig_idx"], inplace=True)
     merged.reset_index(drop=True, inplace=True)
 
     # Filename: BankName_Last4_StartDate-EndDate.xlsx
@@ -664,7 +802,7 @@ def _build_merged_transactions(
                 max_len = max(max_len, len(str(val)) if val is not None else 0)
             ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 55)
 
-    return out_path
+    return out_path, row_mapping
 
 
 # --- 预览 & 转换 / Preview & Convert ---
@@ -714,6 +852,20 @@ with tabs[1]:
     st.write(f"已上传 **{len(uploaded_files)}** 个文件 / file(s)")
 
     if st.button("开始转换 / Start", type="primary", use_container_width=True):
+        # 50MB size limit for merge mode
+        if not sheet_per_table:
+            _total_pdf_size = sum(len(uf.getvalue()) for uf in uploaded_files)
+            _MAX_MERGE_SIZE = 50 * 1024 * 1024
+            if _total_pdf_size > _MAX_MERGE_SIZE:
+                st.error(
+                    f"⚠️ 合并模式下 PDF 总大小不可超过 50MB（当前 {_total_pdf_size / 1024 / 1024:.1f}MB）。\n\n"
+                    f"请使用 [PDF24](https://www.pdf24.org) 等工具压缩 PDF 后重新上传。\n\n"
+                    f"Total PDF size exceeds 50MB limit for merge mode "
+                    f"({_total_pdf_size / 1024 / 1024:.1f}MB). "
+                    f"Please compress your PDFs using PDF24 or similar tools before uploading."
+                )
+                st.stop()
+
         progress_bar = st.progress(0, text="准备中... / Preparing...")
         _verifier = DataVerifier()
         _triple_verifier = TripleVerifier()
@@ -822,14 +974,29 @@ with tabs[1]:
 
             # Merge mode: combine all statement transactions
             merged_excel_path: Path | None = None
+            merged_row_mapping: list[tuple[str, int]] = []
             if not sheet_per_table and merge_txn_data:
-                merged_excel_path = _build_merged_transactions(merge_txn_data, output_dir)
+                result = _build_merged_transactions(merge_txn_data, output_dir)
+                if result:
+                    merged_excel_path, merged_row_mapping = result
 
             progress_bar.progress(1.0, text="完成！/ Done!")
 
             # 存储验证数据到 session_state
             if verify_files:
-                st.session_state.verification_data = {"files": verify_files}
+                vdata: dict = {"files": verify_files}
+                # Store merged verification data
+                if merged_excel_path and merged_row_mapping:
+                    vdata["merged"] = {
+                        "is_merged": True,
+                        "merged_excel_bytes": merged_excel_path.read_bytes(),
+                        "merged_filename": merged_excel_path.stem,
+                        "row_mapping": merged_row_mapping,
+                        "pdf_map": {stem: vf["pdf_bytes"] for stem, vf in verify_files.items()},
+                        "positions_map": {stem: vf.get("row_positions", []) for stem, vf in verify_files.items()},
+                        "headers_map": {stem: vf.get("row_headers", []) for stem, vf in verify_files.items()},
+                    }
+                st.session_state.verification_data = vdata
 
             col1, col2, col3 = st.columns(3)
             col1.metric("总计 / Total", total)
