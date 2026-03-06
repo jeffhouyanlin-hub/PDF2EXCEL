@@ -269,8 +269,10 @@ def _build_merged_verification_payload(
 ) -> dict:
     """Build payload for the merged verification component.
 
-    For each row in the merged Excel, maps back to the source PDF's
-    transaction data for comparison, using row_mapping.
+    Handles three row types:
+    - separator rows (stem="__separator__"): empty rows between blocks
+    - Opening Balance rows (orig_idx=-1): first row of each block
+    - transaction rows: mapped back to source PDF for comparison
     """
     xls = pd.ExcelFile(io.BytesIO(merged_excel_bytes))
     edf = pd.read_excel(xls, sheet_name="Transactions")
@@ -278,6 +280,7 @@ def _build_merged_verification_payload(
 
     segments = [{"sheet": "Transactions", "columns": cols, "startIdx": 0, "endIdx": len(edf)}]
     rows = []
+    tx_total = 0  # count only actual transaction rows for stats
 
     for i in range(len(edf)):
         ev = {}
@@ -285,10 +288,38 @@ def _build_merged_verification_payload(
             raw = str(edf.iloc[i][c]) if str(edf.iloc[i][c]) != "nan" else ""
             ev[c] = raw
 
-        # Map back to source PDF data
         stmt_key, orig_idx = row_mapping[i] if i < len(row_mapping) else ("", 0)
-        pv = dict(ev)  # default: same as Excel
 
+        # --- Separator row ---
+        if stmt_key == "__separator__":
+            rows.append({
+                "seg": 0,
+                "ev": [ev.get(c, "") for c in cols],
+                "pv": [ev.get(c, "") for c in cols],
+                "ok": True,
+                "dc": [],
+                "stmtKey": "__separator__",
+                "pos": None,
+                "rowType": "separator",
+            })
+            continue
+
+        # --- Opening Balance row ---
+        if orig_idx == -1:
+            rows.append({
+                "seg": 0,
+                "ev": [ev.get(c, "") for c in cols],
+                "pv": [ev.get(c, "") for c in cols],
+                "ok": True,
+                "dc": [],
+                "stmtKey": stmt_key,
+                "pos": None,
+                "rowType": "opening_balance",
+            })
+            continue
+
+        # --- Transaction row ---
+        pv = dict(ev)
         vf = verify_files.get(stmt_key)
         if vf and vf.get("expected_dfs"):
             pdf_df = vf["expected_dfs"][0]
@@ -321,6 +352,7 @@ def _build_merged_verification_payload(
                     "ph": round(rp.page_height, 1),
                 }
 
+        tx_total += 1
         rows.append({
             "seg": 0,
             "ev": [ev.get(c, "") for c in cols],
@@ -329,15 +361,20 @@ def _build_merged_verification_payload(
             "dc": diff_cols,
             "stmtKey": stmt_key,
             "pos": pos,
+            "rowType": "transaction",
         })
+
+    tx_matched = sum(1 for r in rows if r.get("rowType") == "transaction" and r["ok"])
+    tx_mismatched = sum(1 for r in rows if r.get("rowType") == "transaction" and not r["ok"])
 
     return {
         "isMerged": True,
         "segments": segments,
         "rows": rows,
         "total": len(rows),
-        "matched": sum(1 for r in rows if r["ok"]),
-        "mismatched": sum(1 for r in rows if not r["ok"]),
+        "txTotal": tx_total,
+        "matched": tx_matched,
+        "mismatched": tx_mismatched,
     }
 
 
@@ -409,12 +446,12 @@ if st.session_state.get("show_verification"):
         stc.html(_m_html, height=720, scrolling=False)
 
         st.divider()
-        _m_matched = _m_payload["matched"]
+        _m_tx_total = _m_payload.get("txTotal", 0)
         _m_mismatched = _m_payload["mismatched"]
         if _m_mismatched == 0:
-            st.success(f"✅ 全部 {_m_payload['total']} 条交易核对一致 / All {_m_payload['total']} transactions matched")
+            st.success(f"✅ 全部 {_m_tx_total} 条交易核对一致 / All {_m_tx_total} transactions matched")
         else:
-            st.warning(f"⚠️ 发现 {_m_mismatched} 处不一致 / Found {_m_mismatched} mismatch(es)")
+            st.warning(f"⚠️ {_m_tx_total} 条交易中发现 {_m_mismatched} 处不一致 / Found {_m_mismatched} mismatch(es) in {_m_tx_total} transactions")
 
         st.stop()
 
@@ -727,69 +764,182 @@ def _extract_year_from_period(period_str: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _extract_month_from_period(period_str: str) -> int | None:
+    """Extract month number from period string like 'January 1, 2025'."""
+    if not period_str:
+        return None
+    dt = pd.to_datetime(period_str, errors="coerce")
+    return dt.month if pd.notna(dt) else None
+
+
+def _parse_tx_month(date_str: str) -> int | None:
+    """Parse month from transaction date like 'Jan 03' or 'Dec 28'."""
+    if not date_str or not str(date_str).strip():
+        return None
+    month_map = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    m = re.match(r"([A-Za-z]{3})", str(date_str).strip())
+    if m:
+        return month_map.get(m.group(1).lower())
+    return None
+
+
+def _filter_january_transactions(
+    txn_df: pd.DataFrame,
+    period_year: int,
+    majority_year: int,
+) -> pd.DataFrame:
+    """Filter transactions in a January PDF based on year rules.
+
+    - January PDF of majority year: remove Dec transactions (prior year)
+    - January PDF of majority year + 1: remove Jan transactions, keep Dec (majority year)
+    """
+    if txn_df.empty:
+        return txn_df
+
+    tx_months = txn_df["Date"].apply(_parse_tx_month)
+
+    if period_year == majority_year:
+        # Jan of majority year: remove Dec rows (they belong to prior year)
+        keep = tx_months != 12
+    elif period_year == majority_year + 1:
+        # Jan of next year: remove Jan rows, keep Dec rows (majority year)
+        keep = tx_months == 12
+    else:
+        # Other years: remove all (shouldn't normally happen)
+        return txn_df.iloc[0:0]
+
+    return txn_df[keep]  # preserve original index for row_mapping
+
+
 def _build_merged_transactions(
     all_txns: list[tuple[str, pd.DataFrame, object]],
     output_dir: Path,
 ) -> tuple[Path, list[tuple[str, int]]] | None:
-    """Merge all statement transactions into one sorted Excel file.
+    """Merge statement transactions into block-based Excel with year filtering.
+
+    Output structure: blocks sorted by period_from (oldest first), each block
+    starts with an Opening Balance row, preserves original PDF row order,
+    separated by 2 empty rows between blocks.
 
     Args:
         all_txns: [(pdf_stem, transactions_df, stmt_info), ...]
         output_dir: output directory
     Returns:
-        (path_to_excel, row_mapping) where row_mapping is
-        [(statement_stem, original_row_index), ...] for each merged row,
-        or None if no data.
+        (path_to_excel, row_mapping) or None.
+        row_mapping: [(stem, orig_idx)] per output row.
+          orig_idx = -1 for Opening Balance rows,
+          stem = "__separator__" for empty separator rows.
     """
     if not all_txns:
         return None
 
-    frames = []
+    # --- Collect metadata ---
     bank_name = ""
     account = ""
-    period_starts: list[pd.Timestamp] = []
-    period_ends: list[pd.Timestamp] = []
+    entries: list[dict] = []
 
     for pdf_stem, txn_df, info in all_txns:
-        df = txn_df.copy()
-        df.insert(0, "Statement", pdf_stem)
-        df["_orig_idx"] = range(len(df))
+        period_from_dt = pd.to_datetime(info.period_from, errors="coerce") if info.period_from else pd.NaT
+        period_to_dt = pd.to_datetime(info.period_to, errors="coerce") if info.period_to else pd.NaT
+        period_year = _extract_year_from_period(info.period_from) or _extract_year_from_period(info.period_to)
+        period_month = _extract_month_from_period(info.period_from)
 
-        # Add year context for date sorting
-        year = (_extract_year_from_period(info.period_from)
-                or _extract_year_from_period(info.period_to)
-                or pd.Timestamp.now().year)
-        df["_sort_date"] = df["Date"].apply(
-            lambda d, y=year: pd.to_datetime(
-                f"{d} {y}" if d and str(d).strip() and not re.search(r"\b20\d{2}\b", str(d)) else str(d),
-                errors="coerce",
-            )
-        )
-        frames.append(df)
+        entries.append({
+            "stem": pdf_stem,
+            "txn_df": txn_df,
+            "info": info,
+            "period_from_dt": period_from_dt,
+            "period_year": period_year or pd.Timestamp.now().year,
+            "period_month": period_month,
+        })
 
         if info.bank_name and not bank_name:
             bank_name = info.bank_name
         if info.account_number and not account:
             account = info.account_number
-        dt_from = pd.to_datetime(info.period_from, errors="coerce") if info.period_from else pd.NaT
-        if pd.notna(dt_from):
-            period_starts.append(dt_from)
-        dt_to = pd.to_datetime(info.period_to, errors="coerce") if info.period_to else pd.NaT
-        if pd.notna(dt_to):
-            period_ends.append(dt_to)
 
-    merged = pd.concat(frames, ignore_index=True)
-    merged.sort_values("_sort_date", inplace=True, na_position="first")
-    # Extract row mapping before dropping helper columns
-    row_mapping = list(zip(merged["Statement"], merged["_orig_idx"].astype(int)))
-    merged.drop(columns=["_sort_date", "_orig_idx"], inplace=True)
-    merged.reset_index(drop=True, inplace=True)
+    # --- Determine majority year ---
+    year_counts: dict[int, int] = {}
+    for e in entries:
+        y = e["period_year"]
+        year_counts[y] = year_counts.get(y, 0) + 1
+    majority_year = max(year_counts, key=year_counts.get)
 
-    # Filename: BankName_Last4_StartDate-EndDate.xlsx
+    # --- Sort entries by period_from (oldest first) ---
+    entries.sort(key=lambda e: e["period_from_dt"] if pd.notna(e["period_from_dt"]) else pd.Timestamp.max)
+
+    # --- Build blocks ---
+    cols = ["Statement", "Date", "Description", "Withdrawals", "Deposits", "Balance"]
+    all_rows: list[dict] = []
+    row_mapping: list[tuple[str, int]] = []
+    blocks_added = 0
+
+    for entry in entries:
+        stem = entry["stem"]
+        info = entry["info"]
+        txn_df = entry["txn_df"].copy()
+        period_month = entry["period_month"]
+        period_year = entry["period_year"]
+
+        # --- Year filtering (January PDFs only) ---
+        if period_month == 1:
+            txn_df = _filter_january_transactions(txn_df, period_year, majority_year)
+
+        # Skip empty blocks after filtering
+        if txn_df.empty:
+            continue
+
+        # --- Separator between blocks ---
+        if blocks_added > 0:
+            for _ in range(2):
+                all_rows.append({c: "" for c in cols})
+                row_mapping.append(("__separator__", -1))
+
+        # --- Opening Balance row ---
+        ob_row = {c: "" for c in cols}
+        ob_row["Statement"] = stem
+        ob_row["Date"] = info.period_from or ""
+        ob_row["Description"] = "Opening Balance"
+        ob_row["Balance"] = info.opening_balance or ""
+        all_rows.append(ob_row)
+        row_mapping.append((stem, -1))
+
+        # --- Transaction rows (preserve original order) ---
+        for orig_idx in range(len(txn_df)):
+            row_data = {c: "" for c in cols}
+            row_data["Statement"] = stem
+            for c in cols:
+                if c == "Statement":
+                    continue
+                if c in txn_df.columns:
+                    val = str(txn_df.iloc[orig_idx][c])
+                    row_data[c] = "" if val == "nan" else val
+            all_rows.append(row_data)
+            # txn_df preserves original index after filtering, so
+            # txn_df.index[i] gives the original row number for position mapping
+            row_mapping.append((stem, int(txn_df.index[orig_idx])))
+
+        blocks_added += 1
+
+    if not all_rows:
+        return None
+
+    merged = pd.DataFrame(all_rows, columns=cols)
+
+    # --- Filename ---
     bank_short = bank_name.replace(" ", "") if bank_name else "Bank"
     last4 = account[-4:] if len(account) >= 4 else (account or "0000")
-    d_start = min(period_starts).strftime("%Y%m%d") if period_starts else "start"
-    d_end = max(period_ends).strftime("%Y%m%d") if period_ends else "end"
+    period_from_dates = [e["period_from_dt"] for e in entries if pd.notna(e["period_from_dt"])]
+    period_to_dates = [
+        pd.to_datetime(e["info"].period_to, errors="coerce")
+        for e in entries
+        if pd.notna(pd.to_datetime(e["info"].period_to, errors="coerce"))
+    ]
+    d_start = min(period_from_dates).strftime("%Y%m%d") if period_from_dates else "start"
+    d_end = max(period_to_dates).strftime("%Y%m%d") if period_to_dates else "end"
     filename = f"{bank_short}_{last4}_{d_start}-{d_end}.xlsx"
 
     out_path = output_dir / filename

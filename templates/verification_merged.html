@@ -39,6 +39,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;f
 /* Statement column highlight */
 .et td.stmt-cell{background:#f0f7ff;font-weight:500;color:#1e40af;font-size:11px}
 .et td.stmt-change{border-top:2px solid #3b82f6}
+/* Opening Balance row */
+.et tr.ob-row td{background:#fffbeb;font-weight:600;color:#92400e;border-bottom:1px solid #fcd34d}
+/* Separator row */
+.et tr.sep-row td{height:12px;border:none;background:#fff}
 
 /* Color box — transparent overlay */
 .cbox{position:absolute;left:0;right:0;pointer-events:none;z-index:10;display:none;transition:top .25s ease}
@@ -103,6 +107,27 @@ for(i=0;i<D.rows.length;i++){
     for(j=0;j<s.columns.length;j++) h+='<th>'+esc(s.columns[j])+'</th>';
     h+='</tr></thead><tbody>';
   }
+  var rt=r.rowType||'transaction';
+  /* Separator row */
+  if(rt==='separator'){
+    h+='<tr data-i="'+i+'" class="sep-row">';
+    for(c=0;c<r.ev.length;c++) h+='<td></td>';
+    h+='</tr>';
+    continue;
+  }
+  /* Opening Balance row */
+  if(rt==='opening_balance'){
+    prevStmt=r.stmtKey;
+    h+='<tr data-i="'+i+'" class="ob-row">';
+    for(c=0;c<r.ev.length;c++){
+      var cls2=(c===0)?'stmt-cell':'';
+      h+='<td'+(cls2?' class="'+cls2+'"':'')+'>';
+      h+=esc(r.ev[c])+'</td>';
+    }
+    h+='</tr>';
+    continue;
+  }
+  /* Transaction row */
   var stmtChanged=(r.stmtKey!==prevStmt);
   prevStmt=r.stmtKey;
   h+='<tr data-i="'+i+'">';
@@ -124,7 +149,7 @@ var sts2=document.getElementById('sts2');
 sts2.innerHTML=
   '<span class="bdg g">\u2713 '+D.matched+'</span>'+
   '<span class="bdg r">\u2717 '+D.mismatched+'</span>'+
-  ' \u5171/Total: '+D.total;
+  ' \u4ea4\u6613/Tx: '+(D.txTotal||0)+' | \u5168\u90e8/All: '+D.total;
 })();
 document.getElementById('ctr').textContent='0 / '+D.total;
 document.getElementById('stt').textContent='\u5c31\u7eea / Ready';
@@ -270,10 +295,14 @@ script.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
 script.onload=function(){
   pdfjsLib=window['pdfjs-dist/build/pdf'];
   pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-  /* Pre-load first statement */
+  /* Pre-load first non-separator statement */
   if(D.total>0){
-    var firstStmt=D.rows[0].stmtKey;
-    switchPdf(firstStmt);
+    for(var fi=0;fi<D.rows.length;fi++){
+      if(D.rows[fi].stmtKey&&D.rows[fi].stmtKey!=='__separator__'){
+        switchPdf(D.rows[fi].stmtKey);
+        break;
+      }
+    }
   }
 };
 document.head.appendChild(script);
@@ -336,22 +365,45 @@ function stepTo(idx){
     if(prev) prev.style.background='';
   }
   curIdx=idx;
+  var r=D.rows[idx];
+  var rt=r.rowType||'transaction';
+
   var cur=esEl.querySelector('tr[data-i="'+idx+'"]');
+
+  /* Separator row: position Excel but hide color boxes */
+  if(rt==='separator'){
+    if(cur) cur.style.background='';
+    ecb.style.display='none'; pcb.style.display='none';
+    positionExcel(idx);
+    ctrEl.textContent=(idx+1)+' / '+D.total;
+    sttEl.textContent='\u2500\u2500 \u5206\u9694 / Separator';
+    return;
+  }
+
   if(cur) cur.style.background='rgba(255,253,231,.6)';
 
-  /* Check if statement changed → switch PDF */
-  var r=D.rows[idx];
-  if(r.stmtKey!==currentStmt){
+  /* Switch PDF if statement changed */
+  if(r.stmtKey!==currentStmt && r.stmtKey!=='__separator__'){
     switchPdf(r.stmtKey);
   }
   updatePdfHeader(r.stmtKey,true);
 
+  /* Opening Balance: show Excel highlight, no PDF position */
+  if(rt==='opening_balance'){
+    ecb.className='cbox grn'; pcb.className='cbox grn';
+    positionExcel(idx);
+    pcb.style.display='none';
+    ctrEl.textContent=(idx+1)+' / '+D.total;
+    sttEl.textContent='\ud83c\udfe6 '+r.stmtKey+' \u2014 Opening Balance';
+    return;
+  }
+
+  /* Transaction row: full comparison + PDF sync */
   applyColor(idx);
   positionExcel(idx);
   syncPdfPos();
 
   ctrEl.textContent=(idx+1)+' / '+D.total;
-  var s=D.segments[r.seg];
   sttEl.textContent=(r.ok?'\u2714 ':'\u2718 ')+r.stmtKey+' \u2014 '+(idx+1);
 }
 
@@ -376,6 +428,8 @@ function pause(){
 function advance(){
   if(!playing) return;
   var next=curIdx+1;
+  /* Skip separator rows during playback */
+  while(next<D.total && (D.rows[next].rowType||'transaction')==='separator') next++;
   if(next>=D.total){
     pause();
     sttEl.textContent='\u2705 \u64ad\u653e\u5b8c\u6bd5 / Playback finished';
