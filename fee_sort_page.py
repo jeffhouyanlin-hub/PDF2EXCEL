@@ -12,7 +12,6 @@ from core.fee_sort.field_mapper import FieldMapper, StandardRow
 from core.fee_sort.merchant_overrides import MerchantOverrides, merchant_signature
 from core.fee_sort.output_builder import OUTPUT_COLUMNS, OutputBuilder
 from core.fee_sort.output_namer import OutputNamer
-from core.fee_sort.rule_engine import Category, RuleEngine
 from core.fee_sort.rule_engine_cc import CCCategory, CreditCardRuleEngine
 
 
@@ -162,7 +161,10 @@ def _filter_january_rows(
 # ---------------------------------------------------------------------------
 
 def _run_classification(merged_data: dict, files_data: dict) -> pd.DataFrame:
-    """Run full FieldMapper → year filter → RuleEngine → OutputBuilder pipeline."""
+    """Run full FieldMapper → year filter → CreditCardRuleEngine → OutputBuilder pipeline.
+
+    Uses the CC rule engine globally (both bank and credit-card schemas).
+    """
     excel_bytes = merged_data["merged_excel_bytes"]
     row_mapping = merged_data["row_mapping"]
 
@@ -176,17 +178,15 @@ def _run_classification(merged_data: dict, files_data: dict) -> pd.DataFrame:
         pairs = _filter_january_rows(std_rows, row_mapping, stem_period, majority_year)
         std_rows = [p[0] for p in pairs]
 
-    # --- Classification — pick engine by schema ---
-    acct = merged_data.get("account_number", "")
-    is_credit_card = merged_data.get("is_credit_card", False)
-    if is_credit_card:
-        engine = CreditCardRuleEngine(
-            tesla_charging_threshold=float(st.session_state.get("_tesla_threshold", 50)),
-            restaurant_personal_threshold=float(st.session_state.get("_restaurant_threshold", 50)),
-            overrides=MerchantOverrides(),
-        )
-    else:
-        engine = RuleEngine(account_numbers=[acct] if acct else [])
+    # --- Classification — one unified engine for both bank and CC schemas.
+    # The CC engine's merchant-based rules apply cleanly to bank descriptions
+    # too; bank-specific semantics (own-account transfers, deposit-only rows)
+    # are handled by OutputBuilder's schema branch and FieldMapper.
+    engine = CreditCardRuleEngine(
+        tesla_charging_threshold=float(st.session_state.get("_tesla_threshold", 50)),
+        restaurant_personal_threshold=float(st.session_state.get("_restaurant_threshold", 50)),
+        overrides=MerchantOverrides(),
+    )
     classifications = [engine.classify(r) for r in std_rows]
 
     bank_acc = _build_bank_acc(merged_data)
@@ -309,9 +309,8 @@ def fee_sort_page() -> None:
         errors="coerce",
     )
 
-    # --- Category options for editor (schema-specific) ---
-    is_cc = merged_data.get("is_credit_card", False)
-    category_options = [c.value for c in (CCCategory if is_cc else Category)]
+    # --- Category options for editor (unified CC taxonomy for both schemas) ---
+    category_options = [c.value for c in CCCategory]
 
     # --- Editable table ---
     edited = st.data_editor(

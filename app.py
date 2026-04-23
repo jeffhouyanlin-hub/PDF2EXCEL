@@ -19,6 +19,7 @@ from core.batch import BatchProcessor
 from core.converter import ExcelConverter, right_align_numbers
 from core.credit_card_parser import CreditCardInfo, CreditCardParser
 from core.extractor import PDFExtractor
+from core.parser_registry import PARSERS, auto_detect, get_parser, label_to_key
 from core.statement_parser import BankStatementParser, RowPosition, StatementInfo
 from core.text_extractor import TextBasedExtractor
 from core.verifier import (
@@ -84,11 +85,12 @@ def _column_widths_for(columns: list[str], is_credit_card: bool) -> list[int | N
     return [schema.get(c) for c in columns]
 
 
+# Mode labels are built from the parser registry so new banks appear
+# automatically in the sidebar when registered in core/parser_registry.py.
 _MODE_LABELS = {
     "自动检测": "自动检测 / Auto Detect",
     "标准表格": "标准表格 / Standard Table",
-    "银行账单": "银行账单 / Bank Statement",
-    "信用卡账单": "信用卡账单 / Credit Card Statement",
+    **{p.label: p.label for p in PARSERS},
 }
 _SHEET_LABELS = {
     "每个表格一个 Sheet": "每个表格一个 Sheet / One Sheet per Table",
@@ -671,7 +673,14 @@ if st.session_state.get("show_verification"):
                 _val = ""
             _sum_items.append({"item": _item, "value": _val})
         try:
-            _summary_positions = BankStatementParser().get_summary_positions(_v_pdf_bytes, _sum_items)
+            # Use the parser that originally produced this file's extraction
+            # so CIBC/RBC etc. each run their own summary-position search.
+            _parser_key = _v_info.get("parser_key")
+            _entry = get_parser(_parser_key) if _parser_key else None
+            if _entry:
+                _summary_positions = _entry.get_summary_positions(_v_pdf_bytes, _sum_items)
+            else:
+                _summary_positions = BankStatementParser().get_summary_positions(_v_pdf_bytes, _sum_items)
         except Exception:
             _summary_positions = None
 
@@ -830,37 +839,41 @@ def _save_to_tmp(uf) -> str:
 
 
 def _try_extract(tmp_path: str, mode: str):
-    """Extract PDF content. Returns (tables, stmt_info, cc_info).
+    """Extract PDF content via the parser registry.
 
-    Exactly one of the three is populated:
-      - tables: list[DataFrame] (standard-table mode)
-      - stmt_info: StatementInfo (bank statement)
-      - cc_info: CreditCardInfo (credit card statement)
+    Returns (tables, stmt_info, cc_info, parser_entry) — exactly one of the
+    first three is populated. `parser_entry` is the ParserEntry that produced
+    the info (None for standard-table / no-match cases). Callers use it to
+    call `.get_row_positions` / `.get_summary_positions` on the SAME parser.
     """
-    if mode == "银行账单":
-        return [], statement_parser.parse(tmp_path), None
-    if mode == "信用卡账单":
-        return [], None, credit_card_parser.parse(tmp_path)
-
     if mode == "标准表格":
-        result = extractor.extract(tmp_path)
-        return result.tables, None, None
+        return extractor.extract(tmp_path).tables, None, None, None
 
-    # Auto-detect: try credit card first (its "POSTING" anchor is unique),
-    # then bank statement, then standard table.
-    cc_info = credit_card_parser.parse(tmp_path)
-    if not cc_info.transactions.empty:
-        return [], None, cc_info
+    # Explicit parser selection — look up by label
+    if mode != "自动检测":
+        key = label_to_key(mode)
+        if key:
+            entry = get_parser(key)
+            info = entry.parse(tmp_path)
+            if entry.schema == "bank":
+                return [], info, None, entry
+            return [], None, info, entry
+        return [], None, None, None
 
+    # Auto-detect: try each registered parser's `can_parse` in priority order.
+    entry = auto_detect(tmp_path)
+    if entry:
+        info = entry.parse(tmp_path)
+        if info.transactions is not None and not info.transactions.empty:
+            if entry.schema == "bank":
+                return [], info, None, entry
+            return [], None, info, entry
+
+    # Final fallback: standard table extraction.
     result = extractor.extract(tmp_path)
     if result.tables:
-        return result.tables, None, None
-
-    stmt_info = statement_parser.parse(tmp_path)
-    if not stmt_info.transactions.empty:
-        return [], stmt_info, None
-
-    return [], None, None
+        return result.tables, None, None, None
+    return [], None, None, None
 
 
 def _statement_to_excel(info, output_path: Path) -> Path:
@@ -1324,7 +1337,7 @@ with tabs[0]:
         with st.expander(f"📄 {uf.name}", expanded=len(uploaded_files) == 1):
             tmp_path = _save_to_tmp(uf)
             try:
-                tables, stmt_info, cc_info = _try_extract(tmp_path, parse_mode)
+                tables, stmt_info, cc_info, _ = _try_extract(tmp_path, parse_mode)
 
                 if tables:
                     st.success(
@@ -1433,15 +1446,15 @@ with tabs[1]:
 
             for i, pdf_path in enumerate(pdf_paths):
                 try:
-                    tables, stmt_info, cc_info = _try_extract(str(pdf_path), parse_mode)
+                    tables, stmt_info, cc_info, _entry = _try_extract(str(pdf_path), parse_mode)
                     out_name = pdf_path.stem + ".xlsx"
                     out_path = output_dir / out_name
 
                     if stmt_info and not stmt_info.transactions.empty:
                         types_seen.add("bank")
                         _statement_to_excel(stmt_info, out_path)
-                        # 获取行坐标
-                        row_headers, row_positions = statement_parser.get_row_positions(pdf_path)
+                        # 获取行坐标 — use the same parser that produced the info
+                        row_headers, row_positions = _entry.get_row_positions(pdf_path)
                         # Summary fields for arithmetic checks
                         summary_dict = {
                             "opening_balance": stmt_info.opening_balance,
@@ -1449,13 +1462,17 @@ with tabs[1]:
                             "total_deposits": stmt_info.total_deposits,
                             "total_withdrawals": stmt_info.total_withdrawals,
                         }
-                        # Source B: text-based extraction (with fallback)
+                        # Source B (TextBasedExtractor) is RBC-specific — only
+                        # enable it for parsers that advertise support. For
+                        # other banks (CIBC, etc.) Layer 1 is skipped to
+                        # avoid false mismatches.
                         source_b_df = pd.DataFrame()
-                        try:
-                            text_result = _text_extractor.extract(pdf_path)
-                            source_b_df = text_result.transactions
-                        except Exception:
-                            pass  # Layer 1 will be marked as skipped
+                        if _entry and _entry.has_source_b:
+                            try:
+                                text_result = _text_extractor.extract(pdf_path)
+                                source_b_df = text_result.transactions
+                            except Exception:
+                                pass  # Layer 1 will be marked as skipped
                         # Triple verification
                         v_result = _triple_verifier.verify_statement(
                             source_a=stmt_info.transactions,
@@ -1480,6 +1497,7 @@ with tabs[1]:
                             "excel_bytes": out_path.read_bytes(),
                             "result": v_result,
                             "is_statement": True,
+                            "parser_key": _entry.key if _entry else None,
                             "row_positions": row_positions,
                             "row_headers": row_headers,
                             "summary_pdf_vals": summary_pdf_vals,
@@ -1490,7 +1508,7 @@ with tabs[1]:
                     elif cc_info and not cc_info.transactions.empty:
                         types_seen.add("cc")
                         _credit_card_to_excel(cc_info, out_path)
-                        row_headers, row_positions = credit_card_parser.get_row_positions(pdf_path)
+                        row_headers, row_positions = _entry.get_row_positions(pdf_path)
                         # Credit cards skip Source B / arithmetic checks — a plain
                         # PDF↔Excel comparison on the Transactions sheet suffices.
                         v_result = _verifier.verify_statement(
@@ -1511,6 +1529,7 @@ with tabs[1]:
                             "pdf_bytes": uf_map[pdf_path.name],
                             "expected_dfs": [cc_info.transactions],
                             "excel_bytes": out_path.read_bytes(),
+                            "parser_key": _entry.key if _entry else None,
                             "result": v_result,
                             "is_statement": True,
                             "is_credit_card": True,

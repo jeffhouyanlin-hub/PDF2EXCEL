@@ -15,8 +15,10 @@ python -m pytest tests/ -v --cov=core
 core/extractor.py              PDFExtractor       pdfplumber 提取表格 → list[DataFrame]
 core/converter.py              ExcelConverter     DataFrame → .xlsx (openpyxl, 自动列宽)
 core/batch.py                  BatchProcessor     ThreadPoolExecutor 并行批处理
-core/statement_parser.py       BankStatementParser 银行账单 PDF 坐标解析
-core/credit_card_parser.py     CreditCardParser    信用卡账单 PDF 坐标解析 (4列schema)
+core/parser_registry.py        PARSERS list        所有银行解析器的中心注册表 + auto-detect
+core/statement_parser.py       BankStatementParser RBC 银行账单 PDF 坐标解析
+core/credit_card_parser.py     CreditCardParser    RBC 信用卡账单 PDF 坐标解析 (4列schema)
+core/parsers/cibc_bank.py      CIBCBankParser      CIBC 银行账单 PDF 解析
 core/verifier.py               DataVerifier       PDF↔Excel 逐单元格对比验证
 core/fee_sort/rule_engine.py   RuleEngine         P0-P7 优先级规则分类引擎
 core/fee_sort/field_mapper.py  FieldMapper        合并 Excel → StandardRow 映射
@@ -79,6 +81,22 @@ fee_sort_page.py               Streamlit Page     费用分类页面 (data_edito
 2. 检查所有新增/修改的数字字段，确认含义与变量名一致
 3. 检查所有金额列有右对齐（Excel: `right_align_numbers` / Streamlit: `NumberColumn`）
 4. 检查所有按钮点击后有可见响应
+
+## 新增银行解析器（Adding a new bank parser）
+
+1. 新建 `core/parsers/{bank}_{type}.py`，实现类包含:
+   - `parse(pdf_path) -> StatementInfo` (bank) 或 `CreditCardInfo` (cc)
+   - `get_row_positions(pdf_path)` 返回 `(headers, [RowPosition])`
+   - `get_summary_positions(pdf_source, summary_items)` 返回 `[RowPosition | None]`
+   - `@staticmethod can_parse(pdf_path) -> bool` — 第一页文本关键词探测
+2. 在 `core/parser_registry.py` 的 `PARSERS` list 追加一条 `ParserEntry`：
+   ```python
+   ParserEntry(key="td_bank", label="TD 银行账单 / TD Bank",
+               schema="bank", priority=25,
+               parse=..., get_row_positions=..., get_summary_positions=...,
+               can_parse=...)
+   ```
+3. 无需修改 UI / merge / T777 / fee_sort — schema-based 分发自动适配
 
 ## Dependencies
 
