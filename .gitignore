@@ -8,3 +8,5 @@ build/
 .env
 .streamlit/secrets.toml
 .coverage
+merchant_overrides.json
+.claude/

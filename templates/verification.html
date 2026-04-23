@@ -25,9 +25,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;f
 
 /* Excel table */
 .seg-hd{padding:5px 10px;background:#f0f0f0;font-weight:600;font-size:11px;color:#6c757d;border-top:1px solid #e0e0e0}
-.et{width:100%;border-collapse:collapse}
-.et th{padding:4px 8px;text-align:left;font-size:11px;color:#6c757d;border-bottom:2px solid #dee2e6;background:#f8f9fa;white-space:nowrap;position:sticky;top:0;z-index:2}
-.et td{padding:4px 8px;white-space:nowrap;border-bottom:1px solid #f0f0f0;font-size:12px}
+.et{width:100%;border-collapse:collapse;table-layout:fixed}
+.et th{padding:4px 8px;text-align:left;font-size:11px;color:#6c757d;border-bottom:2px solid #dee2e6;background:#f8f9fa;white-space:nowrap;position:sticky;top:0;z-index:2;overflow:hidden;text-overflow:ellipsis}
+.et td{padding:4px 8px;white-space:nowrap;border-bottom:1px solid #f0f0f0;font-size:12px;overflow:hidden;text-overflow:ellipsis}
 
 /* Color box — transparent overlay, no data display */
 .cbox{position:absolute;left:0;right:0;pointer-events:none;z-index:10;display:none;transition:top .25s ease}
@@ -93,7 +93,16 @@ for(i=0;i<D.rows.length;i++){
     if(ps>=0) h+='</tbody></table>';
     ps=r.seg;
     h+='<div class="seg-hd">\ud83d\udcd1 '+esc(s.sheet)+'</div>';
-    h+='<table class="et"><thead><tr>';
+    h+='<table class="et">';
+    if(s.colWidths){
+      h+='<colgroup>';
+      for(j=0;j<s.columns.length;j++){
+        var w=s.colWidths[j];
+        h+='<col'+(w?' style="width:'+w+'px"':'')+'>';
+      }
+      h+='</colgroup>';
+    }
+    h+='<thead><tr>';
     for(j=0;j<s.columns.length;j++) h+='<th>'+esc(s.columns[j])+'</th>';
     h+='</tr></thead><tbody>';
   }

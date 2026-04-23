@@ -33,9 +33,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;f
 
 /* Excel table */
 .seg-hd{padding:5px 10px;background:#f0f0f0;font-weight:600;font-size:11px;color:#6c757d;border-top:1px solid #e0e0e0}
-.et{width:100%;border-collapse:collapse}
-.et th{padding:4px 8px;text-align:left;font-size:11px;color:#6c757d;border-bottom:2px solid #dee2e6;background:#f8f9fa;white-space:nowrap;position:sticky;top:0;z-index:2}
-.et td{padding:4px 8px;white-space:nowrap;border-bottom:1px solid #f0f0f0;font-size:12px}
+.et{width:100%;border-collapse:collapse;table-layout:fixed}
+.et th{padding:4px 8px;text-align:left;font-size:11px;color:#6c757d;border-bottom:2px solid #dee2e6;background:#f8f9fa;white-space:nowrap;position:sticky;top:0;z-index:2;overflow:hidden;text-overflow:ellipsis}
+.et td{padding:4px 8px;white-space:nowrap;border-bottom:1px solid #f0f0f0;font-size:12px;overflow:hidden;text-overflow:ellipsis}
 /* Statement column highlight */
 .et td.stmt-cell{background:#f0f7ff;font-weight:500;color:#1e40af;font-size:11px}
 .et td.stmt-change{border-top:2px solid #3b82f6}
@@ -103,7 +103,17 @@ for(i=0;i<D.rows.length;i++){
     if(ps>=0) h+='</tbody></table>';
     ps=r.seg;
     h+='<div class="seg-hd">\ud83d\udcd1 '+esc(s.sheet)+'</div>';
-    h+='<table class="et"><thead><tr>';
+    h+='<table class="et">';
+    /* colgroup for per-schema column widths (falls back to auto when null) */
+    if(s.colWidths){
+      h+='<colgroup>';
+      for(j=0;j<s.columns.length;j++){
+        var w=s.colWidths[j];
+        h+='<col'+(w?' style="width:'+w+'px"':'')+'>';
+      }
+      h+='</colgroup>';
+    }
+    h+='<thead><tr>';
     for(j=0;j<s.columns.length;j++) h+='<th>'+esc(s.columns[j])+'</th>';
     h+='</tr></thead><tbody>';
   }
@@ -394,7 +404,7 @@ function stepTo(idx){
     positionExcel(idx);
     pcb.style.display='none';
     ctrEl.textContent=(idx+1)+' / '+D.total;
-    sttEl.textContent='\ud83c\udfe6 '+r.stmtKey+' \u2014 Opening Balance';
+    sttEl.textContent='\ud83c\udfe6 '+r.stmtKey+' \u2014 '+(D.isCc?'Previous Balance':'Opening Balance');
     return;
   }
 

@@ -16,9 +16,10 @@ import streamlit.components.v1 as stc
 from openpyxl.utils import get_column_letter
 
 from core.batch import BatchProcessor
-from core.converter import ExcelConverter
+from core.converter import ExcelConverter, right_align_numbers
+from core.credit_card_parser import CreditCardInfo, CreditCardParser
 from core.extractor import PDFExtractor
-from core.statement_parser import BankStatementParser, RowPosition
+from core.statement_parser import BankStatementParser, RowPosition, StatementInfo
 from core.text_extractor import TextBasedExtractor
 from core.verifier import (
     ArithmeticIssue,
@@ -28,6 +29,7 @@ from core.verifier import (
     TripleVerifier,
     _normalize,
 )
+from fee_sort_page import fee_sort_page
 
 st.set_page_config(page_title="PDF2EXCEL", page_icon="📊", layout="wide")
 
@@ -52,10 +54,41 @@ st.title("📊 PDF2EXCEL")
 st.caption("PDF 表格 → Excel 批量转换工具 / PDF Table → Excel Batch Converter")
 
 # --- 侧边栏 / Sidebar ---
+# Per-schema column display widths (px) for the Excel panel of the verification
+# view. When a new statement format is introduced, add its column→width map here
+# — any column name not listed falls back to browser default (auto).
+_SCHEMA_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
+    "bank": {
+        "序号": 50,
+        "Date": 90,
+        "Description": 260,
+        "Withdrawals": 95,
+        "Deposits": 95,
+        "Balance": 100,
+        "Statement": 120,
+    },
+    "credit_card": {
+        "序号": 50,
+        "Transaction Date": 90,
+        "Posting Date": 90,
+        "Activity Description": 240,
+        "Amount": 100,
+        "Statement": 120,
+    },
+}
+
+
+def _column_widths_for(columns: list[str], is_credit_card: bool) -> list[int | None]:
+    """Return per-column width in px (None → auto) for the given schema."""
+    schema = _SCHEMA_COLUMN_WIDTHS["credit_card" if is_credit_card else "bank"]
+    return [schema.get(c) for c in columns]
+
+
 _MODE_LABELS = {
     "自动检测": "自动检测 / Auto Detect",
     "标准表格": "标准表格 / Standard Table",
     "银行账单": "银行账单 / Bank Statement",
+    "信用卡账单": "信用卡账单 / Credit Card Statement",
 }
 _SHEET_LABELS = {
     "每个表格一个 Sheet": "每个表格一个 Sheet / One Sheet per Table",
@@ -78,13 +111,40 @@ with st.sidebar:
         format_func=lambda x: _SHEET_LABELS[x],
     )
     sheet_per_table = sheet_mode == "每个表格一个 Sheet"
-    max_workers = st.slider("并行线程数 / Parallel Threads", 1, 15, 4)
+    max_workers = st.slider("并行线程数 / Parallel Threads", 1, 15, 14)
+    with st.expander("🎚 费用分类阈值 / Classification Thresholds"):
+        st.session_state._tesla_threshold = st.slider(
+            "Tesla 充电 / 修理分界值 ($)",
+            min_value=10, max_value=300,
+            value=int(st.session_state.get("_tesla_threshold", 50)),
+            step=5,
+            help="Tesla 交易 ≤ 阈值归 Electricity for vehicle，> 阈值归 Auto Repair",
+        )
+        st.session_state._restaurant_threshold = st.slider(
+            "餐厅 个人 / 业务分界值 ($)",
+            min_value=10, max_value=200,
+            value=int(st.session_state.get("_restaurant_threshold", 50)),
+            step=5,
+            help="非硬编码餐厅 < 阈值默认 Personal；≥ 阈值归 Restaurants 需复核",
+        )
     st.divider()
-    st.caption("© Dr. Jeff Hou · v0.5.0")
+    st.caption("© Dr. Jeff Hou · v0.6.0")
     if st.button("📮 报错反馈 / Error Feedback", use_container_width=True):
         st.session_state.show_feedback = True
+        st.session_state.show_verification = False
+        st.session_state.show_fee_sort = False
+        st.rerun()
     if st.button("🔍 数据复核 / Data Verification", use_container_width=True):
         st.session_state.show_verification = True
+        st.session_state.show_feedback = False
+        st.session_state.show_fee_sort = False
+        st.rerun()
+    _has_merged = bool(st.session_state.get("verification_data", {}).get("merged"))
+    if st.button("📂 费用分类 / Fee Sort", use_container_width=True, disabled=not _has_merged):
+        st.session_state.show_fee_sort = True
+        st.session_state.show_feedback = False
+        st.session_state.show_verification = False
+        st.rerun()
 
 # --- 意见反馈页面 / Feedback Page ---
 if st.session_state.get("show_feedback"):
@@ -150,6 +210,11 @@ if st.session_state.get("show_feedback"):
 
     st.stop()
 
+# --- 费用分类页面 / Fee Sort Page ---
+if st.session_state.get("show_fee_sort"):
+    fee_sort_page()
+    st.stop()
+
 
 def _build_verification_payload(
     unified_rows: list[dict],
@@ -174,6 +239,11 @@ def _build_verification_payload(
             segments.append({
                 "sheet": row["sheet"],
                 "columns": row["columns"],
+                "colWidths": _column_widths_for(
+                    row["columns"],
+                    is_credit_card="Amount" in row["columns"]
+                    and "Withdrawals" not in row["columns"],
+                ),
                 "startIdx": i,
             })
             prev_sheet = row["sheet"]
@@ -266,6 +336,7 @@ def _build_merged_verification_payload(
     merged_excel_bytes: bytes,
     row_mapping: list[tuple[str, int]],
     verify_files: dict,
+    is_credit_card: bool = False,
 ) -> dict:
     """Build payload for the merged verification component.
 
@@ -277,8 +348,13 @@ def _build_merged_verification_payload(
     xls = pd.ExcelFile(io.BytesIO(merged_excel_bytes))
     edf = pd.read_excel(xls, sheet_name="Transactions")
     cols = list(edf.columns)
+    col_widths = _column_widths_for(cols, is_credit_card)
 
-    segments = [{"sheet": "Transactions", "columns": cols, "startIdx": 0, "endIdx": len(edf)}]
+    segments = [{
+        "sheet": "Transactions", "columns": cols,
+        "colWidths": col_widths,
+        "startIdx": 0, "endIdx": len(edf),
+    }]
     rows = []
     tx_total = 0  # count only actual transaction rows for stats
 
@@ -369,6 +445,7 @@ def _build_merged_verification_payload(
 
     return {
         "isMerged": True,
+        "isCc": is_credit_card,
         "segments": segments,
         "rows": rows,
         "total": len(rows),
@@ -410,7 +487,7 @@ if st.session_state.get("show_verification"):
     # === Merged mode verification ===
     _merged_data = _vdata.get("merged")
     if _merged_data and _merged_data.get("is_merged"):
-        _m_hdr = st.columns([5, 2, 1.5])
+        _m_hdr = st.columns([4, 2, 2, 1.5])
         with _m_hdr[0]:
             st.subheader("🔍 合并数据复核 / Merged Data Verification")
         with _m_hdr[1]:
@@ -423,6 +500,11 @@ if st.session_state.get("show_verification"):
                 key="verify_download_merged",
             )
         with _m_hdr[2]:
+            if st.button("📂 进入费用分类 / Fee Sort", key="enter_fee_sort", use_container_width=True):
+                st.session_state.show_fee_sort = True
+                st.session_state.show_verification = False
+                st.rerun()
+        with _m_hdr[3]:
             if st.button("↩ 返回 / Back", key="verify_back_merged", use_container_width=True):
                 st.session_state.show_verification = False
                 st.rerun()
@@ -432,6 +514,7 @@ if st.session_state.get("show_verification"):
             _merged_data["merged_excel_bytes"],
             _merged_data["row_mapping"],
             _vdata["files"],
+            is_credit_card=_merged_data.get("is_credit_card", False),
         )
         _m_payload_json = json.dumps(_m_payload, ensure_ascii=False)
 
@@ -679,31 +762,65 @@ if st.session_state.get("show_verification"):
     st.stop()
 
 # --- 文件上传 / File Upload ---
-uploaded_files = st.file_uploader(
-    "上传 PDF 文件 / Upload PDF Files",
-    type=["pdf"],
-    accept_multiple_files=True,
-)
+# The file_uploader's `key` is versioned so a "Clear" button can reset it by
+# bumping the version (Streamlit only ties widget state to key identity).
+if "_uploader_version" not in st.session_state:
+    st.session_state._uploader_version = 0
 
-if not uploaded_files:
-    # No files → clear stale verification cache
-    st.session_state.pop("verification_data", None)
+_up_col, _clear_col = st.columns([9, 1])
+with _up_col:
+    uploaded_files = st.file_uploader(
+        "上传 PDF 文件 / Upload PDF Files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key=f"pdf_uploader_{st.session_state._uploader_version}",
+    )
+with _clear_col:
+    st.write("")  # vertical spacer to align with the uploader label
+    st.write("")
+    if st.button(
+        "🗑 清空 / Clear",
+        key="clear_uploads",
+        use_container_width=True,
+        help="清空上次上传的 PDF 文件及缓存 / Clear uploaded files and cache",
+    ):
+        st.session_state._uploader_version += 1
+        st.session_state.pop("verification_data", None)
+        st.session_state.pop("fee_sort_df", None)
+        st.session_state.pop("_uploaded_file_names", None)
+        st.rerun()
+
+if uploaded_files:
+    # Sort by filename ascending so statements process chronologically across
+    # preview / batch-convert / single-file verification dropdown. RBC and most
+    # bank filenames embed the period_to date (e.g. "...2025-01-06.pdf"), so
+    # alphabetic order == chronological. The merged Excel still sorts by
+    # parsed period_to_dt as a second safety net.
+    uploaded_files = sorted(uploaded_files, key=lambda f: f.name.lower())
+
+    # Track uploaded file names; clear caches when files change
+    _cur_file_names = frozenset(f.name for f in uploaded_files)
+    _prev_file_names = st.session_state.get("_uploaded_file_names", frozenset())
+    if _cur_file_names != _prev_file_names:
+        st.session_state.pop("verification_data", None)
+        st.session_state.pop("fee_sort_df", None)
+        st.session_state["_uploaded_file_names"] = _cur_file_names
+elif st.session_state.get("verification_data"):
+    # No files in uploader but cached data exists — keep it
+    # (happens after returning from verification/fee_sort sub-pages)
+    pass
+else:
+    # No files and no cache → prompt upload
     st.session_state.pop("_uploaded_file_names", None)
     st.info("请上传一个或多个 PDF 文件开始转换。/ Please upload one or more PDF files to start.")
     st.stop()
-
-# Track uploaded file names; clear verification cache when files change
-_cur_file_names = frozenset(f.name for f in uploaded_files)
-_prev_file_names = st.session_state.get("_uploaded_file_names", frozenset())
-if _cur_file_names != _prev_file_names:
-    st.session_state.pop("verification_data", None)
-    st.session_state["_uploaded_file_names"] = _cur_file_names
 
 st.divider()
 
 extractor = PDFExtractor()
 converter = ExcelConverter()
 statement_parser = BankStatementParser()
+credit_card_parser = CreditCardParser()
 
 
 def _save_to_tmp(uf) -> str:
@@ -713,20 +830,37 @@ def _save_to_tmp(uf) -> str:
 
 
 def _try_extract(tmp_path: str, mode: str):
-    """尝试提取 PDF 内容。返回 (tables, statement_info)。"""
+    """Extract PDF content. Returns (tables, stmt_info, cc_info).
+
+    Exactly one of the three is populated:
+      - tables: list[DataFrame] (standard-table mode)
+      - stmt_info: StatementInfo (bank statement)
+      - cc_info: CreditCardInfo (credit card statement)
+    """
     if mode == "银行账单":
-        info = statement_parser.parse(tmp_path)
-        return [], info
+        return [], statement_parser.parse(tmp_path), None
+    if mode == "信用卡账单":
+        return [], None, credit_card_parser.parse(tmp_path)
+
+    if mode == "标准表格":
+        result = extractor.extract(tmp_path)
+        return result.tables, None, None
+
+    # Auto-detect: try credit card first (its "POSTING" anchor is unique),
+    # then bank statement, then standard table.
+    cc_info = credit_card_parser.parse(tmp_path)
+    if not cc_info.transactions.empty:
+        return [], None, cc_info
 
     result = extractor.extract(tmp_path)
-    if result.tables or mode == "标准表格":
-        return result.tables, None
+    if result.tables:
+        return result.tables, None, None
 
-    # 自动检测：标准提取无结果，回退到银行账单解析
-    info = statement_parser.parse(tmp_path)
-    if not info.transactions.empty:
-        return [], info
-    return [], None
+    stmt_info = statement_parser.parse(tmp_path)
+    if not stmt_info.transactions.empty:
+        return [], stmt_info, None
+
+    return [], None, None
 
 
 def _statement_to_excel(info, output_path: Path) -> Path:
@@ -753,6 +887,40 @@ def _statement_to_excel(info, output_path: Path) -> Path:
                 for val in df.iloc[:, col_idx - 1]:
                     max_len = max(max_len, len(str(val)) if val is not None else 0)
                 ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 55)
+            right_align_numbers(ws)
+    return output_path
+
+
+def _credit_card_to_excel(info: CreditCardInfo, output_path: Path) -> Path:
+    """Write credit-card statement to Excel (Summary + Transactions sheets)."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary_data = {
+            "Item": [
+                "Bank Name", "Account Number", "Period From", "Period To",
+                "Previous Balance", "New Balance",
+                "Minimum Payment", "Payment Due Date", "Credit Limit",
+            ],
+            "Value": [
+                info.bank_name, info.account_number,
+                info.period_from, info.period_to,
+                info.previous_balance, info.new_balance,
+                info.minimum_payment, info.payment_due_date, info.credit_limit,
+            ],
+        }
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        info.transactions.to_excel(writer, sheet_name="Transactions", index=False)
+
+        for sheet_name in ["Summary", "Transactions"]:
+            ws = writer.sheets[sheet_name]
+            df = summary_df if sheet_name == "Summary" else info.transactions
+            for col_idx, col_name in enumerate(df.columns, 1):
+                max_len = len(str(col_name))
+                for val in df.iloc[:, col_idx - 1]:
+                    max_len = max(max_len, len(str(val)) if val is not None else 0)
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 55)
+            right_align_numbers(ws)
     return output_path
 
 
@@ -814,6 +982,19 @@ def _filter_january_transactions(
     return txn_df[keep]  # preserve original index for row_mapping
 
 
+def _sequence_numbers(row_mapping: list[tuple[str, int]]) -> list:
+    """Build the 序号 column: 1-based sequence across non-separator rows."""
+    seq: list = []
+    n = 0
+    for stem, _orig in row_mapping:
+        if stem == "__separator__":
+            seq.append("")
+        else:
+            n += 1
+            seq.append(n)
+    return seq
+
+
 def _build_merged_transactions(
     all_txns: list[tuple[str, pd.DataFrame, object]],
     output_dir: Path,
@@ -844,14 +1025,15 @@ def _build_merged_transactions(
     for pdf_stem, txn_df, info in all_txns:
         period_from_dt = pd.to_datetime(info.period_from, errors="coerce") if info.period_from else pd.NaT
         period_to_dt = pd.to_datetime(info.period_to, errors="coerce") if info.period_to else pd.NaT
-        period_year = _extract_year_from_period(info.period_from) or _extract_year_from_period(info.period_to)
-        period_month = _extract_month_from_period(info.period_from)
+        period_year = _extract_year_from_period(info.period_to) or _extract_year_from_period(info.period_from)
+        period_month = _extract_month_from_period(info.period_to) or _extract_month_from_period(info.period_from)
 
         entries.append({
             "stem": pdf_stem,
             "txn_df": txn_df,
             "info": info,
             "period_from_dt": period_from_dt,
+            "period_to_dt": period_to_dt,
             "period_year": period_year or pd.Timestamp.now().year,
             "period_month": period_month,
         })
@@ -861,15 +1043,25 @@ def _build_merged_transactions(
         if info.account_number and not account:
             account = info.account_number
 
-    # --- Determine majority year ---
-    year_counts: dict[int, int] = {}
+    # --- Determine majority year (exclude January PDFs from voting) ---
+    non_jan_year_counts: dict[int, int] = {}
+    all_year_counts: dict[int, int] = {}
     for e in entries:
         y = e["period_year"]
-        year_counts[y] = year_counts.get(y, 0) + 1
-    majority_year = max(year_counts, key=year_counts.get)
+        all_year_counts[y] = all_year_counts.get(y, 0) + 1
+        if e["period_month"] != 1:
+            non_jan_year_counts[y] = non_jan_year_counts.get(y, 0) + 1
+    if non_jan_year_counts:
+        majority_year = max(non_jan_year_counts, key=non_jan_year_counts.get)
+    else:
+        # All PDFs are January — use the smallest year
+        majority_year = min(all_year_counts)
 
-    # --- Sort entries by period_from (oldest first) ---
-    entries.sort(key=lambda e: e["period_from_dt"] if pd.notna(e["period_from_dt"]) else pd.Timestamp.max)
+    # --- Sort entries by statement date (period_to, always has year) ---
+    # period_from often lacks a year in the PDF (e.g. "JAN 07" with no year),
+    # which parses to NaT and scrambles chronological order. period_to is
+    # always full-date, so use it as the primary sort key.
+    entries.sort(key=lambda e: e["period_to_dt"] if pd.notna(e["period_to_dt"]) else pd.Timestamp.max)
 
     # --- Build blocks ---
     cols = ["Statement", "Date", "Description", "Withdrawals", "Deposits", "Balance"]
@@ -932,6 +1124,11 @@ def _build_merged_transactions(
 
     merged = pd.DataFrame(all_rows, columns=cols)
 
+    # Reorder: 序号 (1-based; separators blank) first, Statement last.
+    merged.insert(0, "序号", _sequence_numbers(row_mapping))
+    out_cols = ["序号"] + [c for c in cols if c != "Statement"] + ["Statement"]
+    merged = merged[out_cols]
+
     # --- Filename ---
     bank_short = bank_name.replace(" ", "") if bank_name else "Bank"
     last4 = account[-4:] if len(account) >= 4 else (account or "0000")
@@ -950,10 +1147,170 @@ def _build_merged_transactions(
         merged.to_excel(writer, sheet_name="Transactions", index=False)
         ws = writer.sheets["Transactions"]
         for col_idx, col_name in enumerate(merged.columns, 1):
+            if col_name == "Date":
+                ws.column_dimensions[get_column_letter(col_idx)].width = 12
+                continue
             max_len = len(str(col_name))
             for val in merged.iloc[:, col_idx - 1]:
                 max_len = max(max_len, len(str(val)) if val is not None else 0)
             ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 55)
+        right_align_numbers(ws)
+
+    return out_path, row_mapping
+
+
+def _parse_cc_txn_month(date_str: str) -> int | None:
+    """Parse month from a credit-card transaction date like 'JAN 05' or 'DEC 27'."""
+    return _parse_tx_month(date_str)
+
+
+def _filter_january_cc_transactions(
+    txn_df: pd.DataFrame,
+    period_year: int,
+    majority_year: int,
+) -> pd.DataFrame:
+    """January credit-card PDF year filter — mirrors bank logic on 'Transaction Date'."""
+    if txn_df.empty or "Transaction Date" not in txn_df.columns:
+        return txn_df
+    tx_months = txn_df["Transaction Date"].apply(_parse_cc_txn_month)
+    if period_year == majority_year:
+        keep = tx_months != 12
+    elif period_year == majority_year + 1:
+        keep = tx_months == 12
+    else:
+        return txn_df.iloc[0:0]
+    return txn_df[keep]
+
+
+def _build_merged_credit_card_transactions(
+    all_txns: list[tuple[str, pd.DataFrame, CreditCardInfo]],
+    output_dir: Path,
+) -> tuple[Path, list[tuple[str, int]]] | None:
+    """Merge credit-card transactions into a block-based Excel.
+
+    Schema: [Transaction Date, Posting Date, Activity Description, Amount, Statement].
+    Each block is prefixed with a "Previous Balance" row (parallel to the bank
+    flow's Opening Balance row). Blocks are separated by 2 empty rows.
+    """
+    if not all_txns:
+        return None
+
+    bank_name = ""
+    account = ""
+    entries: list[dict] = []
+
+    for pdf_stem, txn_df, info in all_txns:
+        period_from_dt = pd.to_datetime(info.period_from, errors="coerce") if info.period_from else pd.NaT
+        period_to_dt = pd.to_datetime(info.period_to, errors="coerce") if info.period_to else pd.NaT
+        period_year = _extract_year_from_period(info.period_to) or _extract_year_from_period(info.period_from)
+        period_month = _extract_month_from_period(info.period_to) or _extract_month_from_period(info.period_from)
+        entries.append({
+            "stem": pdf_stem,
+            "txn_df": txn_df,
+            "info": info,
+            "period_from_dt": period_from_dt,
+            "period_to_dt": period_to_dt,
+            "period_year": period_year or pd.Timestamp.now().year,
+            "period_month": period_month,
+        })
+        if info.bank_name and not bank_name:
+            bank_name = info.bank_name
+        if info.account_number and not account:
+            account = info.account_number
+
+    # Majority year (exclude January PDFs from voting).
+    non_jan_year_counts: dict[int, int] = {}
+    all_year_counts: dict[int, int] = {}
+    for e in entries:
+        y = e["period_year"]
+        all_year_counts[y] = all_year_counts.get(y, 0) + 1
+        if e["period_month"] != 1:
+            non_jan_year_counts[y] = non_jan_year_counts.get(y, 0) + 1
+    if non_jan_year_counts:
+        majority_year = max(non_jan_year_counts, key=non_jan_year_counts.get)
+    else:
+        majority_year = min(all_year_counts)
+
+    # Sort by statement date (period_to); see note in _build_merged_transactions.
+    entries.sort(key=lambda e: e["period_to_dt"] if pd.notna(e["period_to_dt"]) else pd.Timestamp.max)
+
+    cols = ["Statement", "Transaction Date", "Posting Date", "Activity Description", "Amount"]
+    all_rows: list[dict] = []
+    row_mapping: list[tuple[str, int]] = []
+    blocks_added = 0
+
+    for entry in entries:
+        stem = entry["stem"]
+        info = entry["info"]
+        txn_df = entry["txn_df"].copy()
+        if entry["period_month"] == 1:
+            txn_df = _filter_january_cc_transactions(
+                txn_df, entry["period_year"], majority_year
+            )
+        if txn_df.empty:
+            continue
+
+        if blocks_added > 0:
+            for _ in range(2):
+                all_rows.append({c: "" for c in cols})
+                row_mapping.append(("__separator__", -1))
+
+        # Previous Balance row (parallel to Opening Balance).
+        pb_row = {c: "" for c in cols}
+        pb_row["Statement"] = stem
+        pb_row["Transaction Date"] = info.period_from or ""
+        pb_row["Activity Description"] = "Previous Balance"
+        pb_row["Amount"] = info.previous_balance or ""
+        all_rows.append(pb_row)
+        row_mapping.append((stem, -1))
+
+        for orig_idx in range(len(txn_df)):
+            row_data = {c: "" for c in cols}
+            row_data["Statement"] = stem
+            for c in cols:
+                if c == "Statement":
+                    continue
+                if c in txn_df.columns:
+                    val = str(txn_df.iloc[orig_idx][c])
+                    row_data[c] = "" if val == "nan" else val
+            all_rows.append(row_data)
+            row_mapping.append((stem, int(txn_df.index[orig_idx])))
+
+        blocks_added += 1
+
+    if not all_rows:
+        return None
+
+    merged = pd.DataFrame(all_rows, columns=cols)
+    merged.insert(0, "序号", _sequence_numbers(row_mapping))
+    out_cols = ["序号"] + [c for c in cols if c != "Statement"] + ["Statement"]
+    merged = merged[out_cols]
+
+    bank_short = bank_name.replace(" ", "") if bank_name else "CreditCard"
+    last4 = account[-4:] if len(account) >= 4 else (account or "0000")
+    period_from_dates = [e["period_from_dt"] for e in entries if pd.notna(e["period_from_dt"])]
+    period_to_dates = [
+        pd.to_datetime(e["info"].period_to, errors="coerce")
+        for e in entries
+        if pd.notna(pd.to_datetime(e["info"].period_to, errors="coerce"))
+    ]
+    d_start = min(period_from_dates).strftime("%Y%m%d") if period_from_dates else "start"
+    d_end = max(period_to_dates).strftime("%Y%m%d") if period_to_dates else "end"
+    filename = f"{bank_short}_{last4}_{d_start}-{d_end}.xlsx"
+
+    out_path = output_dir / filename
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        merged.to_excel(writer, sheet_name="Transactions", index=False)
+        ws = writer.sheets["Transactions"]
+        for col_idx, col_name in enumerate(merged.columns, 1):
+            if col_name in ("Transaction Date", "Posting Date"):
+                ws.column_dimensions[get_column_letter(col_idx)].width = 14
+                continue
+            max_len = len(str(col_name))
+            for val in merged.iloc[:, col_idx - 1]:
+                max_len = max(max_len, len(str(val)) if val is not None else 0)
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 55)
+        right_align_numbers(ws)
 
     return out_path, row_mapping
 
@@ -967,7 +1324,7 @@ with tabs[0]:
         with st.expander(f"📄 {uf.name}", expanded=len(uploaded_files) == 1):
             tmp_path = _save_to_tmp(uf)
             try:
-                tables, stmt_info = _try_extract(tmp_path, parse_mode)
+                tables, stmt_info, cc_info = _try_extract(tmp_path, parse_mode)
 
                 if tables:
                     st.success(
@@ -995,6 +1352,29 @@ with tabs[0]:
                     col4.metric("总支出 / Withdrawals", f"${stmt_info.total_withdrawals}")
                     st.markdown("**交易明细 / Transactions**")
                     st.dataframe(stmt_info.transactions, use_container_width=True)
+                elif cc_info and not cc_info.transactions.empty:
+                    st.success(
+                        f"信用卡账单模式 — 检测到 {len(cc_info.transactions)} 笔交易 / "
+                        f"Credit card — {len(cc_info.transactions)} transaction(s)"
+                    )
+                    st.markdown("**账户摘要 / Account Summary**")
+                    if cc_info.bank_name:
+                        st.metric("银行 / Bank", cc_info.bank_name)
+                    col1, col2 = st.columns(2)
+                    col1.metric("账户 / Account", cc_info.account_number)
+                    col2.metric(
+                        "期间 / Period",
+                        f"{cc_info.period_from} ~ {cc_info.period_to}",
+                    )
+                    col3, col4, col5 = st.columns(3)
+                    col3.metric("上期余额 / Previous", f"${cc_info.previous_balance}")
+                    col4.metric("本期余额 / New", f"${cc_info.new_balance}")
+                    col5.metric("信用额度 / Credit Limit", f"${cc_info.credit_limit}")
+                    col6, col7 = st.columns(2)
+                    col6.metric("最低还款 / Min Payment", f"${cc_info.minimum_payment}")
+                    col7.metric("到期日 / Due Date", cc_info.payment_due_date)
+                    st.markdown("**交易明细 / Transactions**")
+                    st.dataframe(cc_info.transactions, use_container_width=True)
                 else:
                     st.warning("未检测到表格或交易数据。/ No tables or transactions detected.")
             except Exception as e:
@@ -1002,9 +1382,12 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("批量转换 / Batch Convert")
-    st.write(f"已上传 **{len(uploaded_files)}** 个文件 / file(s)")
 
-    if st.button("开始转换 / Start", type="primary", use_container_width=True):
+    # Auto-convert once per file set (skip if already converted)
+    _already_converted = st.session_state.get("verification_data") is not None
+    if _already_converted:
+        st.info("已完成转换，如需重新转换请重新上传文件。/ Conversion done. Re-upload files to reconvert.")
+    else:
         # 50MB size limit for merge mode
         if not sheet_per_table:
             _total_pdf_size = sum(len(uf.getvalue()) for uf in uploaded_files)
@@ -1045,14 +1428,17 @@ with tabs[1]:
             errors: list[str] = []
             verify_files: dict = {}
             merge_txn_data: list = []
+            merge_cc_data: list = []
+            types_seen: set[str] = set()  # track {"bank", "cc", "table"} for mixed-upload check
 
             for i, pdf_path in enumerate(pdf_paths):
                 try:
-                    tables, stmt_info = _try_extract(str(pdf_path), parse_mode)
+                    tables, stmt_info, cc_info = _try_extract(str(pdf_path), parse_mode)
                     out_name = pdf_path.stem + ".xlsx"
                     out_path = output_dir / out_name
 
                     if stmt_info and not stmt_info.transactions.empty:
+                        types_seen.add("bank")
                         _statement_to_excel(stmt_info, out_path)
                         # 获取行坐标
                         row_headers, row_positions = statement_parser.get_row_positions(pdf_path)
@@ -1101,7 +1487,41 @@ with tabs[1]:
                         }
                         if not sheet_per_table:
                             merge_txn_data.append((pdf_path.stem, stmt_info.transactions, stmt_info))
+                    elif cc_info and not cc_info.transactions.empty:
+                        types_seen.add("cc")
+                        _credit_card_to_excel(cc_info, out_path)
+                        row_headers, row_positions = credit_card_parser.get_row_positions(pdf_path)
+                        # Credit cards skip Source B / arithmetic checks — a plain
+                        # PDF↔Excel comparison on the Transactions sheet suffices.
+                        v_result = _verifier.verify_statement(
+                            cc_info.transactions, out_path
+                        )
+                        summary_pdf_vals = {
+                            "Bank Name": cc_info.bank_name,
+                            "Account Number": cc_info.account_number,
+                            "Period From": cc_info.period_from,
+                            "Period To": cc_info.period_to,
+                            "Previous Balance": cc_info.previous_balance,
+                            "New Balance": cc_info.new_balance,
+                            "Minimum Payment": cc_info.minimum_payment,
+                            "Payment Due Date": cc_info.payment_due_date,
+                            "Credit Limit": cc_info.credit_limit,
+                        }
+                        verify_files[pdf_path.stem] = {
+                            "pdf_bytes": uf_map[pdf_path.name],
+                            "expected_dfs": [cc_info.transactions],
+                            "excel_bytes": out_path.read_bytes(),
+                            "result": v_result,
+                            "is_statement": True,
+                            "is_credit_card": True,
+                            "row_positions": row_positions,
+                            "row_headers": row_headers,
+                            "summary_pdf_vals": summary_pdf_vals,
+                        }
+                        if not sheet_per_table:
+                            merge_cc_data.append((pdf_path.stem, cc_info.transactions, cc_info))
                     elif tables:
+                        types_seen.add("table")
                         from core.extractor import ExtractionResult
                         result = ExtractionResult(tables=tables, page_count=0, source=str(pdf_path))
                         converter.convert(result, out_path, sheet_per_table)
@@ -1125,13 +1545,31 @@ with tabs[1]:
 
                 progress_bar.progress((i + 1) / total, text=f"处理中... / Processing {i + 1}/{total}")
 
-            # Merge mode: combine all statement transactions
+            # Reject mixed-type uploads — batch must be homogeneous for merge
+            # mode (different schemas can't coexist). Allow standard-tables to
+            # mix with a single statement type only.
+            stmt_types = types_seen & {"bank", "cc"}
+            if len(stmt_types) > 1:
+                st.error(
+                    "⚠️ 不支持混合上传银行账单与信用卡账单，请分两批处理。\n\n"
+                    "Mixed bank + credit-card uploads are not supported. "
+                    "Please upload each type separately."
+                )
+                st.stop()
+
+            # Merge mode: combine all statement transactions (one type only).
             merged_excel_path: Path | None = None
             merged_row_mapping: list[tuple[str, int]] = []
+            merged_is_credit_card = False
             if not sheet_per_table and merge_txn_data:
                 result = _build_merged_transactions(merge_txn_data, output_dir)
                 if result:
                     merged_excel_path, merged_row_mapping = result
+            elif not sheet_per_table and merge_cc_data:
+                result = _build_merged_credit_card_transactions(merge_cc_data, output_dir)
+                if result:
+                    merged_excel_path, merged_row_mapping = result
+                    merged_is_credit_card = True
 
             progress_bar.progress(1.0, text="完成！/ Done!")
 
@@ -1140,14 +1578,18 @@ with tabs[1]:
                 vdata: dict = {"files": verify_files}
                 # Store merged verification data
                 if merged_excel_path and merged_row_mapping:
+                    first_vf = next(iter(verify_files.values()))
                     vdata["merged"] = {
                         "is_merged": True,
+                        "is_credit_card": merged_is_credit_card,
                         "merged_excel_bytes": merged_excel_path.read_bytes(),
                         "merged_filename": merged_excel_path.stem,
                         "row_mapping": merged_row_mapping,
                         "pdf_map": {stem: vf["pdf_bytes"] for stem, vf in verify_files.items()},
                         "positions_map": {stem: vf.get("row_positions", []) for stem, vf in verify_files.items()},
                         "headers_map": {stem: vf.get("row_headers", []) for stem, vf in verify_files.items()},
+                        "bank_name": first_vf.get("summary_pdf_vals", {}).get("Bank Name", ""),
+                        "account_number": first_vf.get("summary_pdf_vals", {}).get("Account Number", ""),
                     }
                 st.session_state.verification_data = vdata
 
@@ -1171,9 +1613,63 @@ with tabs[1]:
                     )
                 else:
                     st.warning(
-                        f"⚠️ 发现 {total_diffs} 处不一致，请点击侧边栏「数据复核」查看详情 / "
-                        f"Found {total_diffs} mismatch(es), click 'Data Verification' in sidebar for details"
+                        f"⚠️ 发现 {total_diffs} 处不一致。"
+                        f"注意：合并数据复核页面仅比对合并 Excel 的 Transactions 行，"
+                        f"不包括 Source-B 交叉验证 / 算术校验 / 被年份过滤掉的行。"
+                        f"下方展开「差异详情」查看具体位置。"
                     )
+                    with st.expander(f"📋 差异详情 / Mismatch Details ({total_diffs})", expanded=True):
+                        for _stem, _vf in verify_files.items():
+                            _r = _vf["result"]
+                            if _r.matched:
+                                continue
+                            st.markdown(f"**📄 {_stem}**")
+                            # Triple verifier: break down by layer
+                            _layers = getattr(_r, "layers", None)
+                            if _layers:
+                                for _layer in _layers:
+                                    if _layer.passed or _layer.skipped:
+                                        continue
+                                    st.caption(
+                                        f"🔸 {_layer.label} — "
+                                        f"{_layer.mismatched_cells} 处 / mismatches"
+                                    )
+                                    # Arithmetic issues
+                                    if _layer.arithmetic_issues:
+                                        for _ai in _layer.arithmetic_issues[:10]:
+                                            st.write(f"  • {_ai.message}")
+                                    # Cell diffs
+                                    if _layer.diffs:
+                                        _rows = [
+                                            {
+                                                "Sheet": d.sheet,
+                                                "Row": d.row + 1,
+                                                "Column": d.column,
+                                                "PDF / Expected": (d.expected or "(空)")[:60],
+                                                "Excel / Actual": (d.actual or "(空)")[:60],
+                                            }
+                                            for d in _layer.diffs[:20]
+                                        ]
+                                        st.dataframe(
+                                            pd.DataFrame(_rows),
+                                            use_container_width=True, hide_index=True,
+                                        )
+                            elif _r.diffs:
+                                # Plain VerificationResult (credit card path)
+                                _rows = [
+                                    {
+                                        "Sheet": d.sheet,
+                                        "Row": d.row + 1,
+                                        "Column": d.column,
+                                        "PDF / Expected": (d.expected or "(空)")[:60],
+                                        "Excel / Actual": (d.actual or "(空)")[:60],
+                                    }
+                                    for d in _r.diffs[:20]
+                                ]
+                                st.dataframe(
+                                    pd.DataFrame(_rows),
+                                    use_container_width=True, hide_index=True,
+                                )
 
             if merged_excel_path:
                 with open(merged_excel_path, "rb") as f:
