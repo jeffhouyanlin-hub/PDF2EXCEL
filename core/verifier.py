@@ -100,9 +100,11 @@ def _normalize_cross(value: object) -> str:
     Numeric values are canonicalized without commas (e.g. '2,788.09' → '2788.09').
     """
     base = _normalize(value)
-    # For numeric values, canonicalize to comma-free form
+    # Try numeric path first — strip commas AND all whitespace so inputs like
+    # "- 55,503.68" (space after sign) parse identically to "-55,503.68".
+    cleaned = re.sub(r"\s+", "", base.replace(",", ""))
     try:
-        num = float(base.replace(",", ""))
+        num = float(cleaned)
         if not (num != num):  # not NaN
             rounded = f"{round(num, 2):.2f}"
             return rounded.rstrip("0").rstrip(".")

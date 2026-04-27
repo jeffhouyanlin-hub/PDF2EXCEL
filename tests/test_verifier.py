@@ -22,6 +22,23 @@ def verifier():
     return DataVerifier()
 
 
+class TestNormalizeCrossNumericEquivalence:
+    """_normalize_cross must canonicalize equivalent numeric values."""
+
+    def test_signed_with_space_after_minus(self):
+        """'- 55,503.68' (A-source, space after minus) must equal '-55,503.68'."""
+        assert _normalize_cross("- 55,503.68") == _normalize_cross("-55,503.68")
+
+    def test_commas_vs_no_commas(self):
+        assert _normalize_cross("1,234.56") == _normalize_cross("1234.56")
+
+    def test_trailing_zero_stripping(self):
+        assert _normalize_cross("100.00") == _normalize_cross("100")
+
+    def test_falls_back_to_text_when_non_numeric(self):
+        assert _normalize_cross("Term Loan") == _normalize_cross("TermLoan")
+
+
 def _write_excel(dfs: list[pd.DataFrame], path: Path, sheet_names: list[str] | None = None) -> Path:
     """辅助：将 DataFrame 列表写入 Excel。"""
     with pd.ExcelWriter(path, engine="openpyxl") as writer:

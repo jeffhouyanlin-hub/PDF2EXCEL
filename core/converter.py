@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
 from core.extractor import ExtractionResult
+
+
+def right_align_numbers(ws) -> None:
+    """Right-align all numeric cells in a worksheet (skip header row)."""
+    _NUM_RE = re.compile(r"^-?[\d,]+\.?\d*$")
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            if cell.value is not None:
+                val = str(cell.value).strip()
+                if val and _NUM_RE.match(val):
+                    cell.alignment = Alignment(horizontal="right")
 
 
 class ExcelConverter:
@@ -49,7 +62,7 @@ class ExcelConverter:
 
     @staticmethod
     def _auto_column_width(writer, sheet_name: str, df) -> None:
-        """自动调整列宽。"""
+        """自动调整列宽 + 数字右对齐。"""
         ws = writer.sheets[sheet_name]
         for col_idx, col_name in enumerate(df.columns, 1):
             max_len = len(str(col_name))
@@ -58,3 +71,4 @@ class ExcelConverter:
                 max_len = max(max_len, cell_len)
             letter = get_column_letter(col_idx)
             ws.column_dimensions[letter].width = min(max_len + 2, 50)
+        right_align_numbers(ws)
